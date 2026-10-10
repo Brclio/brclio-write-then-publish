@@ -1,0 +1,10 @@
+{
+  "name": "write-then-publish",
+  "version": "1.0.0",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "scripts": {
+    "open": "open index.html",
+    "start": "python3 server.py"
+  }
+}
