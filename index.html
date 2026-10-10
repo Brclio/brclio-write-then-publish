@@ -1365,7 +1365,7 @@
       if (window.WRITE_THEN_PUBLISH_LOCAL_MODE) {
         document.body.classList.add("local-deployment");
         document.title = "写了就发（本地版）";
-      } else {
+      } else if (!window.WRITE_THEN_PUBLISH_STORAGE) {
         document.write('<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"><\/script>');
         document.write('<script src="src/supabase-config.js?v=20260729-auth"><\/script>');
         document.write('<script src="src/supabase.js?v=20261005-migration-zip"><\/script>');

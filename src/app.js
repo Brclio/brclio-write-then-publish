@@ -63,6 +63,7 @@ function isMigrationTestUser(user) {
 }
 
 async function resolveAccountPolicy() {
+  if (githubStorageEnabled()) { ACCOUNT_MAINTENANCE = false; return; }
   if (LOCAL_DEPLOYMENT_MODE) return;
   let remaining = MIGRATION_END_AT - Date.now();
   let timeout;
@@ -648,6 +649,7 @@ const cloudState = {
   syncingProfile: false,
   profileTimer: 0,
   pendingAvatarUpload: false,
+  pendingProfileSync: false,
   localImportProjects: [],
   legacyProjects: [],
   legacyProjectsStatus: "idle",
@@ -1264,12 +1266,16 @@ function debounce(fn, wait = 140) {
 }
 
 function saveState() {
+  if (githubStorageEnabled() && (cloudState.loadingWorkspace || githubProjectSync.readingProject)) return;
   try {
     const data = readForm();
     if (isBuiltInProjectId(state.currentProjectId)) {
       updateProjectHistory();
       return;
     }
+    const snapshotKey = githubSyncKey(activeStorageScope, state.currentProjectId);
+    const fingerprint = githubStorageEnabled() ? githubFormFingerprint(data) : "";
+    if (githubStorageEnabled() && githubFormSnapshots.get(snapshotKey) === fingerprint) return;
     saveAuthorProfile(data);
 
     const now = Date.now();
@@ -1280,17 +1286,18 @@ function saveState() {
       state.projects.unshift(current);
     }
     current.data = data;
-    current.title = projectTitleFromData(data);
+    current.title = projectTitleFromData(data) + (current.cloudConflictCopy ? " · 本机冲突副本" : "");
     current.updatedAt = now;
     state.projects = [
       current,
       ...state.projects.filter((project) => project.id !== current.id),
-    ].slice(0, MAX_PROJECTS);
+    ].slice(0, githubStorageEnabled() ? undefined : MAX_PROJECTS);
     storageForScope().setItem(
       scopedStorageKey(STORAGE_KEY),
       JSON.stringify(withExternalizedImages(data, current.id)),
     );
     saveProjectStore();
+    if (githubStorageEnabled()) githubFormSnapshots.set(githubSyncKey(activeStorageScope, current.id), fingerprint);
     updateProjectHistory();
   } catch {
     els.status.textContent = "本次内容较大，浏览器未写入本地缓存";
@@ -1310,6 +1317,229 @@ function loadState() {
 
 function cloudApi() {
   return window.WriteThenPublishCloud || null;
+}
+
+function githubStorageEnabled() {
+  return cloudApi()?.provider === "github";
+}
+
+const githubProjectSync = {
+  timer: 0, pending: new Map(), running: null, revisions: new Map(), deleted: new Set(), blocked: new Set(),
+};
+const githubProfileFingerprints = new Map();
+const githubFormSnapshots = new Map();
+
+function githubFormFingerprint(data = readForm()) {
+  return JSON.stringify(data, (key, value) => ["storagePath", "videoStoragePath", "srcKey"].includes(key) ? undefined : value);
+}
+
+function rememberGitHubFormSnapshot() {
+  if (githubStorageEnabled()) githubFormSnapshots.set(githubSyncKey(activeStorageScope, state.currentProjectId), githubFormFingerprint());
+}
+
+function githubProfilePendingKey(scope = activeStorageScope) {
+  return `writeThenPublishGitHubPendingProfile.v1.${scope}`;
+}
+
+function storedGitHubPendingProfile(scope = activeStorageScope) {
+  try { return JSON.parse(localStorage.getItem(githubProfilePendingKey(scope)) || "null"); } catch { return null; }
+}
+
+function githubSyncKey(scope, id) {
+  return `${scope}:${id}`;
+}
+
+function githubSyncNotice(message, error = false) {
+  if (els.accountSyncStatus) els.accountSyncStatus.textContent = message;
+  if (error) els.status.textContent = message;
+}
+
+function scheduleGitHubProjectSync() {
+  if (!githubStorageEnabled() || !cloudIsReady() || cloudState.loadingWorkspace) return;
+  const scope = activeStorageScope;
+  const session = cloudState.session;
+  if (scope !== accountScope(session?.user?.id)) return;
+  for (const project of state.projects) {
+    const key = githubSyncKey(scope, project.id);
+    if (isBuiltInProject(project) || githubProjectSync.deleted.has(key) || githubProjectSync.blocked.has(key)
+      || project.cloudSyncedAt === project.updatedAt) continue;
+    githubProjectSync.pending.set(key, { scope, session, project: JSON.parse(JSON.stringify(project)) });
+  }
+  if (!githubProjectSync.pending.size) return;
+  githubSyncNotice("已保存本机缓存，等待同步到 GitHub 私有仓库…");
+  window.clearTimeout(githubProjectSync.timer);
+  githubProjectSync.timer = window.setTimeout(() => { void flushGitHubProjectSync(); }, 900);
+}
+
+async function githubAssetName(blob, image, video = false) {
+  const digest = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
+  const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hash}.${portableMediaExtension(blob, video ? image.videoName : image.name, video)}`;
+}
+
+async function prepareGitHubProject(snapshot) {
+  const { project, scope, session } = snapshot;
+  const copy = JSON.parse(JSON.stringify(project));
+  const key = githubSyncKey(scope, project.id);
+  const api = cloudApi();
+  const assertActive = () => {
+    if (githubProjectSync.deleted.has(key) || cloudState.user?.id !== session.user.id || activeStorageScope !== scope) {
+      throw new Error("账号或稿件已变化，本次同步已停止，本机缓存仍然保留。");
+    }
+  };
+  for (const [id, image] of Object.entries(copy.data?.images || {})) {
+    if (!image || typeof image !== "object") continue;
+    assertActive();
+    const original = project.data.images[id];
+    // Existing repository assets are immutable and can be reused when their source is not locally loaded.
+    const ownAssetPrefix = `/projects/${project.id}/assets/`;
+    const coverIsOwnAsset = String(original.storagePath || "").includes(ownAssetPrefix);
+    if (original.src || !coverIsOwnAsset) {
+      const cover = await githubCoverBlob(original, session);
+      assertActive();
+      const assetId = await githubAssetName(cover, image);
+      if (!coverIsOwnAsset || !image.storagePath?.endsWith(`/${assetId}`)) {
+        image.storagePath = (await api.uploadProjectAsset(project.id, assetId, cover, { session })).path;
+      }
+    }
+    if (!image.storagePath) throw new Error(`图片/GIF 未同步：${image.name || id}`);
+    image.src = "";
+    delete image.srcKey;
+    delete image.previewVideoSrc;
+    if (image.kind === "live") {
+      const localVideo = liveMediaFiles.get(String(image.videoKey || id))?.blob
+        || await readLiveMediaBlob(String(image.videoKey || id)).catch(() => null);
+      const videoIsOwnAsset = String(image.videoStoragePath || "").includes(ownAssetPrefix);
+      if (localVideo || !videoIsOwnAsset) {
+        const video = localVideo || (original.videoStoragePath
+          ? await api.downloadProjectAsset(original.videoStoragePath, { session })
+          : await portableVideoBlob(original, id));
+        assertActive();
+        const assetId = await githubAssetName(video, image, true);
+        if (!videoIsOwnAsset || !image.videoStoragePath?.endsWith(`/${assetId}`)) {
+          image.videoStoragePath = (await api.uploadProjectAsset(project.id, assetId, video, { session })).path;
+        }
+      }
+      if (!image.videoStoragePath) throw new Error(`实况原视频未同步：${image.videoName || id}`);
+    }
+  }
+  assertActive();
+  copy.revision = githubProjectSync.revisions.get(key) || project.cloudRevision || null;
+  return copy;
+}
+
+async function githubCoverBlob(image, session) {
+  const src = image.src || (image.srcKey ? await readImageSource(image.srcKey).catch(() => null) : "");
+  if (src) {
+    try {
+      const response = await fetch(src);
+      if (response.ok) return response.blob();
+    } catch { /* The repository copy can recover an expired local blob URL. */ }
+  }
+  if (image.storagePath) return cloudApi().downloadProjectAsset(image.storagePath, { session });
+  throw new Error(`图片或 GIF 原件缺失：${image.name || "未命名素材"}`);
+}
+
+function createGitHubConflictCopy(project) {
+  const copy = { ...project, id: createProject(project.data).id, data: JSON.parse(JSON.stringify(project.data)), updatedAt: Date.now(), cloudConflictCopy: true };
+  copy.title = `${projectTitleFromData(copy.data)} · 本机冲突副本`;
+  delete copy.cloudRevision;
+  delete copy.cloudSyncedAt;
+  return copy;
+}
+
+async function preserveGitHubConflict(snapshot) {
+  const rows = await cloudApi().listProjects({ session: snapshot.session });
+  if (cloudState.user?.id !== snapshot.session.user.id || activeStorageScope !== snapshot.scope) return false;
+  const current = state.projects.find((project) => project.id === snapshot.project.id);
+  if (!current) return false;
+  const remote = rows.find((row) => row.id === current.id);
+  if (!remote || remote.revision === (githubProjectSync.revisions.get(githubSyncKey(snapshot.scope, current.id)) || current.cloudRevision)) return false;
+  const copy = createGitHubConflictCopy(current);
+  const cloudProject = cloudProjectFromRow(remote);
+  state.projects = [copy, ...(cloudProject ? [cloudProject] : []), ...state.projects.filter((project) => project.id !== current.id)];
+  if (state.currentProjectId === current.id) state.currentProjectId = copy.id;
+  githubProjectSync.pending.delete(githubSyncKey(snapshot.scope, current.id));
+  githubProjectSync.blocked.delete(githubSyncKey(snapshot.scope, current.id));
+  if (cloudProject) githubProjectSync.revisions.set(githubSyncKey(snapshot.scope, current.id), cloudProject.cloudRevision);
+  saveProjectStore();
+  updateProjectHistory();
+  githubSyncNotice("另一设备已修改稿件：云端版本保持原名，本机内容已另存为「本机冲突副本」，可在历史记录中分别打开。", true);
+  return true;
+}
+
+async function flushGitHubProjectSync({ requireSuccess = false } = {}) {
+  if (!githubStorageEnabled()) return;
+  window.clearTimeout(githubProjectSync.timer);
+  githubProjectSync.timer = 0;
+  if (!githubProjectSync.running) {
+    githubProjectSync.running = (async () => {
+      while (githubProjectSync.pending.size) {
+        const [key, snapshot] = githubProjectSync.pending.entries().next().value;
+        githubProjectSync.pending.delete(key);
+        if (githubProjectSync.deleted.has(key) || githubProjectSync.blocked.has(key)) continue;
+        const { scope, session, project } = snapshot;
+        if (cloudState.user?.id !== session.user.id || activeStorageScope !== scope) continue;
+        try {
+          githubSyncNotice(`正在同步「${project.title || "未命名图文"}」及原始素材…`);
+          const prepared = await prepareGitHubProject(snapshot);
+          const row = await cloudApi().saveProject(prepared, { session });
+          githubProjectSync.revisions.set(key, row.revision);
+          if (cloudState.user?.id !== session.user.id || activeStorageScope !== scope) continue;
+          const current = state.projects.find((item) => item.id === project.id);
+          if (!current) continue;
+          current.cloudRevision = row.revision;
+          current.cloudSyncedAt = project.updatedAt;
+          if (current.updatedAt === project.updatedAt) {
+            for (const [id, image] of Object.entries(prepared.data.images || {})) {
+              if (current.data.images?.[id]) {
+                current.data.images[id].storagePath = image.storagePath;
+                if (image.videoStoragePath) current.data.images[id].videoStoragePath = image.videoStoragePath;
+              }
+            }
+          }
+          saveProjectStore();
+        } catch (error) {
+          if (githubProjectSync.deleted.has(key)) continue;
+          if (error.status === 409) {
+            githubProjectSync.blocked.add(key);
+            try { if (await preserveGitHubConflict(snapshot)) continue; } catch { /* Preserve the dirty cache until the repository can be read again. */ }
+          }
+          if (cloudState.user?.id === session.user.id && activeStorageScope === scope) {
+            githubSyncNotice(error.status === 409
+              ? `「${project.title}」在另一设备已修改；本机内容已保留。请恢复网络后刷新，将自动保留云端版本和本机冲突副本。`
+              : `GitHub 未同步：${error?.message || "网络暂不可用"}。本机缓存已保留，请恢复网络后重试。`, true);
+          }
+          // Failed snapshots stay dirty in the local cache; never label them as synced.
+          break;
+        }
+      }
+      const dirty = state.projects.some((project) => !isBuiltInProject(project) && project.cloudSyncedAt !== project.updatedAt);
+      if (!dirty && !githubProjectSync.pending.size) githubSyncNotice("正文、排版、图片/GIF 和实况原视频已同步到 GitHub 私有仓库。");
+    })().finally(() => { githubProjectSync.running = null; });
+  }
+  await githubProjectSync.running;
+  if (requireSuccess && state.projects.some((project) => !isBuiltInProject(project) && project.cloudSyncedAt !== project.updatedAt)) {
+    throw new Error("当前稿件尚未同步。请先恢复网络或下载 ZIP 保留原稿，再切换账号。");
+  }
+}
+
+async function deleteGitHubProject(project) {
+  const scope = activeStorageScope;
+  const session = cloudState.session;
+  const key = githubSyncKey(scope, project.id);
+  githubProjectSync.deleted.add(key);
+  githubProjectSync.pending.delete(key);
+  try {
+    if (githubProjectSync.running) await githubProjectSync.running;
+    if (cloudState.user?.id !== session?.user?.id || activeStorageScope !== scope) throw new Error("账号已切换，请重新删除。");
+    await cloudApi().deleteProject(project.id, githubProjectSync.revisions.get(key) || project.cloudRevision, { session });
+    return true;
+  } catch (error) {
+    githubProjectSync.deleted.delete(key);
+    githubSyncNotice(`删除未同步，稿件已保留：${error?.message || "请恢复网络后重试"}`, true);
+    return false;
+  }
 }
 
 function cloudIsReady() {
@@ -1572,6 +1802,7 @@ function authRedirectStatus() {
 }
 
 function setAccountAuthMode(mode, { keepNotice = false } = {}) {
+  if (githubStorageEnabled() && mode === "reset") mode = "signin";
   accountAuthMode = ["signup", "reset"].includes(mode) ? mode : "signin";
   const signingUp = accountAuthMode === "signup";
   const resetting = accountAuthMode === "reset";
@@ -1583,7 +1814,7 @@ function setAccountAuthMode(mode, { keepNotice = false } = {}) {
     if (!resetting) els.accountNewPassword.value = "";
   }
   if (els.accountForgotPassword) {
-    els.accountForgotPassword.hidden = resetting || signingUp || Boolean(cloudState.user) || !cloudApi()?.configured;
+    els.accountForgotPassword.hidden = githubStorageEnabled() || resetting || signingUp || Boolean(cloudState.user) || !cloudApi()?.configured;
   }
   if (resetting) {
     if (els.accountSignIn) els.accountSignIn.textContent = "保存新密码";
@@ -1604,7 +1835,7 @@ function setAccountAuthMode(mode, { keepNotice = false } = {}) {
   if (els.accountPassword) els.accountPassword.autocomplete = signingUp ? "new-password" : "current-password";
   if (els.accountSignIn) els.accountSignIn.textContent = signingUp ? "注册" : "登录";
   if (els.accountResendConfirmation) {
-    els.accountResendConfirmation.hidden = signingUp || Boolean(cloudState.user) || !cloudApi()?.configured || !pendingConfirmationEmail;
+    els.accountResendConfirmation.hidden = githubStorageEnabled() || signingUp || Boolean(cloudState.user) || !cloudApi()?.configured || !pendingConfirmationEmail;
   }
   setAccountPasswordVisible(false);
   if (!keepNotice && cloudApi()?.configured) setAccountNotice("");
@@ -1677,7 +1908,7 @@ function updateAccountUi() {
   }
   if (els.accountMenuDescription) {
     els.accountMenuDescription.textContent = signedIn
-      ? "只同步头像昵称；请下载 ZIP 保留原稿"
+      ? githubStorageEnabled() ? "稿件和原始素材同步到 GitHub 私有仓库" : "只同步头像昵称；请下载 ZIP 保留原稿"
       : "草稿仅临时保存在当前标签页";
   }
   if (els.accountMenuLogin) els.accountMenuLogin.hidden = signedIn;
@@ -1698,7 +1929,7 @@ function updateAccountUi() {
   if (els.accountAuthForm) els.accountAuthForm.hidden = signedIn && !showingAddAccountForm;
   if (els.accountSignedIn) els.accountSignedIn.hidden = !signedIn || showingAddAccountForm;
   if (els.accountResendConfirmation) {
-    els.accountResendConfirmation.hidden = signedIn || !configured || accountAuthMode === "signup" || !pendingConfirmationEmail;
+    els.accountResendConfirmation.hidden = githubStorageEnabled() || signedIn || !configured || accountAuthMode === "signup" || !pendingConfirmationEmail;
   }
 
   renderAccountSessionList(els.accountMenuAccountList);
@@ -1720,13 +1951,26 @@ function updateAccountUi() {
     els.accountDisplayName.textContent = els.displayName.value.trim() || "未命名作者";
     els.accountEmailLabel.textContent = cloudState.user.email || "";
     const localCount = cloudState.localImportProjects.length;
-    els.accountImportLocal.hidden = localCount < 1 || !ACCOUNT_MAINTENANCE;
+    els.accountImportLocal.hidden = localCount < 1 || (!ACCOUNT_MAINTENANCE && !githubStorageEnabled());
     if (localCount) els.accountImportLocal.innerHTML = `<i data-lucide="folder-input"></i>导入 ${localCount} 条游客 / 旧本机草稿到此账号`;
   }
   if (!ACCOUNT_MAINTENANCE) els.accountSignedIn?.querySelector(".account-sync-card strong")?.replaceChildren("账号资料");
+  if (githubStorageEnabled()) updateGitHubStorageCopy();
   updateFeatureBadges();
   updateMigrationTestUi();
   if (window.lucide) window.lucide.createIcons();
+}
+
+function updateGitHubStorageCopy() {
+  if (els.accountForgotPassword) els.accountForgotPassword.hidden = true;
+  if (els.accountOauth) els.accountOauth.hidden = true;
+  const replace = (selector, text) => document.querySelector(selector)?.replaceChildren(text);
+  replace(".maintenance-welcome-main > p", "登录后，稿件和原始素材会同步到站点的 GitHub 私有仓库；游客内容仅保留在当前标签页。");
+  replace(".maintenance-account-hint", "每个账号使用独立文件夹；正文和素材以明文存储在站点管理员配置的私有仓库。");
+  replace(".entry-choice-head > p", "无需登录即可排版；登录后同步稿件、排版和原始素材。");
+  replace(".account-option .entry-choice-kicker", "稿件与素材同步");
+  replace(".account-option > div > p", "正文、图片/GIF 和实况原视频保存在 GitHub 私有仓库，可在不同设备继续编辑。");
+  replace(".account-sync-card strong", "GitHub 私有仓库存储");
 }
 
 function updateMigrationTestUi() {
@@ -2176,8 +2420,13 @@ function startAddingAccount() {
 }
 
 async function waitForCloudSyncBeforeAccountSwitch() {
+  if (githubStorageEnabled() && cloudState.user && activeStorageScope === accountScope(cloudState.user.id)) {
+    saveState();
+    scheduleGitHubProjectSync();
+    await flushGitHubProjectSync({ requireSuccess: true });
+  }
   const deadline = Date.now() + 120000;
-  const hasPendingProfile = Boolean(cloudState.profileTimer || cloudState.pendingAvatarUpload);
+  const hasPendingProfile = Boolean(cloudState.profileTimer || cloudState.pendingAvatarUpload || cloudState.pendingProfileSync);
   window.clearTimeout(cloudState.profileTimer);
   cloudState.profileTimer = 0;
   while (cloudState.syncingProfile && Date.now() < deadline) {
@@ -2187,7 +2436,7 @@ async function waitForCloudSyncBeforeAccountSwitch() {
     throw new Error("当前账号资料仍在同步，请稍后再切换。");
   }
   if (hasPendingProfile || cloudState.pendingAvatarUpload) await flushCloudProfileSync();
-  if (cloudState.pendingAvatarUpload || cloudState.syncingProfile) {
+  if (cloudState.pendingAvatarUpload || cloudState.pendingProfileSync || cloudState.syncingProfile) {
     throw new Error("当前账号资料仍未同步，请稍后再切换。");
   }
 }
@@ -2503,6 +2752,7 @@ async function chooseGuestMode() {
   if (cloudState.user) {
     cloudState.signingOut = true;
     try {
+      if (githubStorageEnabled()) await waitForCloudSyncBeforeAccountSwitch();
       await cloudApi().signOutLocal();
       await handleCloudSession(null);
     } finally { cloudState.signingOut = false; }
@@ -2687,12 +2937,29 @@ function chooseLoginMode() {
 
 function cloudProjectFromRow(row) {
   const updatedAt = Date.parse(row.updated_at) || Date.now();
+  const data = githubStorageEnabled() ? githubProjectDataFromRow(row) : row.data;
   return normalizeProject({
     id: row.id,
     title: row.title,
     updatedAt,
-    data: row.data,
+    createdAt: row.created_at,
+    ...(githubStorageEnabled() ? { cloudRevision: row.revision, cloudSyncedAt: updatedAt } : {}),
+    data,
   });
+}
+
+function githubProjectDataFromRow(row) {
+  const data = JSON.parse(JSON.stringify(row.data || {}));
+  for (const image of Object.values(data.images || {})) {
+    if (!image || typeof image !== "object") continue;
+    if (image.storagePath) { image.src = ""; delete image.srcKey; }
+    if (image.kind === "live" && image.videoStoragePath) {
+      // Remote video versions must never share a browser cache entry with an older source.
+      image.videoKey = `github:${cloudState.user?.id}:${row.id}:${image.videoStoragePath}`;
+      delete image.previewVideoSrc;
+    }
+  }
+  return data;
 }
 
 /** blob: 链接刷新即失效（旧版本本机缓存里的云端图片全是这种），当作没有。 */
@@ -2703,6 +2970,7 @@ function isPersistableImageSource(src) {
 /** 把云端素材补到本机，返回没下载成功的数量。 */
 async function hydrateCloudProject(project) {
   const api = cloudApi();
+  const boundSession = githubStorageEnabled() ? cloudState.session : null;
   const images = project?.data?.images;
   if (!api?.configured || !images || typeof images !== "object") return 0;
   let failed = 0;
@@ -2717,7 +2985,7 @@ async function hydrateCloudProject(project) {
             image.src = local;
           } else {
             // 存成 data URL 而不是 blob 链接：saveProjectStore 会把它写进 IndexedDB，刷新后还在
-            const blob = await api.downloadProjectAsset(image.storagePath);
+            const blob = await api.downloadProjectAsset(image.storagePath, boundSession ? { session: boundSession } : undefined);
             image.src = await readFileAsDataURL(blob);
           }
         }
@@ -2729,7 +2997,7 @@ async function hydrateCloudProject(project) {
           if (cached) {
             if (!liveMediaFiles.get(key)?.blob) replaceLiveMediaCache(key, cached, image.videoName || "video.mov");
           } else {
-            const videoBlob = await api.downloadProjectAsset(image.videoStoragePath);
+            const videoBlob = await api.downloadProjectAsset(image.videoStoragePath, boundSession ? { session: boundSession } : undefined);
             await writeLiveMediaBlob(key, videoBlob);
             replaceLiveMediaCache(key, videoBlob, image.videoName || "video.mov");
           }
@@ -2748,7 +3016,7 @@ async function hydrateCloudProject(project) {
 const hydratingCloudProjects = new Map();
 
 function hydrateCloudProjectOnce(project) {
-  const key = project?.id;
+  const key = project?.id && (githubStorageEnabled() ? `${cloudState.user?.id}:${project.id}` : project.id);
   if (!key) return hydrateCloudProject(project);
   if (!hydratingCloudProjects.has(key)) {
     hydratingCloudProjects.set(
@@ -2761,7 +3029,7 @@ function hydrateCloudProjectOnce(project) {
 
 /** 迁移期保留登录用户的本机历史入口；11 月起在线版隐藏入口，数据留在本机供恢复。 */
 function syncHistoryAvailability() {
-  const disabled = activeStorageScope === "guest" || (!LOCAL_DEPLOYMENT_MODE && !ACCOUNT_MAINTENANCE);
+  const disabled = activeStorageScope === "guest" || (!LOCAL_DEPLOYMENT_MODE && !ACCOUNT_MAINTENANCE && !githubStorageEnabled());
   document.body.classList.toggle("history-disabled", disabled);
   if (disabled) setHistoryOpen(false);
 }
@@ -2788,7 +3056,7 @@ async function activateWorkspaceScope(scope, projects = null, profile = null) {
     }
 
     if (Array.isArray(projects)) {
-      const list = projects.filter(Boolean).slice(0, MAX_PROJECTS);
+      const list = projects.filter(Boolean).slice(0, githubStorageEnabled() ? undefined : MAX_PROJECTS);
       state.projects = list;
       state.currentProjectId = state.projects[0]?.id || GUIDE_CARDS_PROJECT_ID;
       saveProjectStore();
@@ -2804,12 +3072,14 @@ async function activateWorkspaceScope(scope, projects = null, profile = null) {
     resetTextHistory();
     updateProjectHistory();
     await render();
+    rememberGitHubFormSnapshot();
   } finally {
     cloudState.loadingWorkspace = false;
   }
 }
 
 async function loadCloudWorkspace(session) {
+  if (githubStorageEnabled()) return loadGitHubWorkspace(session);
   const api = cloudApi();
   const user = session?.user;
   if (!api?.configured || !user) return;
@@ -2875,6 +3145,95 @@ async function loadCloudWorkspace(session) {
       : isCloudRestrictedMessage(error?.message) ? "云端同步维护中，本机草稿照常可用" : "旧稿清单读取失败，请刷新重试";
   } finally {
     cloudState.loadingUserId = "";
+    setAccountBusy(false);
+    updateAccountUi();
+  }
+}
+
+async function loadGitHubWorkspace(session) {
+  const api = cloudApi();
+  const user = session?.user;
+  if (!api?.configured || !user || cloudState.loadingUserId === user.id) return;
+  const scope = accountScope(user.id);
+  const cached = loadProjectStoreForScope(scope);
+  const pendingProfile = storedGitHubPendingProfile(scope);
+  cloudState.pendingProfileSync = Boolean(pendingProfile);
+  cloudState.pendingAvatarUpload = Boolean(pendingProfile?.avatar);
+  let resolvedActiveId = cached.activeId;
+  cloudState.loadingUserId = user.id;
+  cloudState.session = session;
+  cloudState.user = user;
+  cloudState.localImportProjects = [...loadProjectStoreForScope("guest").projects, ...loadProjectStoreForScope("local").projects]
+    .filter((project, index, list) => list.findIndex((item) => item.id === project.id) === index);
+  setAccountBusy(true);
+  githubSyncNotice("正在读取 GitHub 私有仓库中的稿件与资料…");
+  updateAccountUi();
+  try {
+    const [profileResult, projectsResult] = await Promise.allSettled([
+      api.getProfile({ session }), api.listProjects({ session }),
+    ]);
+    if (cloudState.user?.id !== user.id) return;
+    let projects = cached.projects;
+    let conflict = false;
+    if (projectsResult.status === "fulfilled") {
+      const remote = new Map(projectsResult.value.map(cloudProjectFromRow).filter(Boolean).map((project) => [project.id, project]));
+      for (const local of cached.projects) {
+        const key = githubSyncKey(scope, local.id);
+        const repositoryProject = remote.get(local.id);
+        if (local.cloudSyncedAt !== local.updatedAt) {
+          if (repositoryProject && local.cloudRevision !== repositoryProject.cloudRevision) {
+            const copy = createGitHubConflictCopy(local);
+            remote.set(copy.id, copy);
+            if (resolvedActiveId === local.id) resolvedActiveId = copy.id;
+            githubProjectSync.blocked.delete(key);
+            conflict = true;
+          } else remote.set(local.id, local);
+        }
+      }
+      projects = [...remote.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+      for (const project of projects) {
+        if (project.cloudRevision) githubProjectSync.revisions.set(githubSyncKey(scope, project.id), project.cloudRevision);
+      }
+      // Keep the last open draft when available; an empty repository never erases unsynced local work.
+      const activeIndex = projects.findIndex((project) => project.id === resolvedActiveId);
+      if (activeIndex > 0) projects.unshift(...projects.splice(activeIndex, 1));
+    }
+    let profile = profileResult.status === "fulfilled" ? profileResult.value : null;
+    const remoteAvatar = profile?.avatar_url || "";
+    if (profile) githubProfileFingerprints.set(scope, JSON.stringify({ displayName: profile.display_name || "未命名作者", avatarUrl: remoteAvatar }));
+    if (pendingProfile) {
+      const localProfile = loadAuthorProfileForScope(scope);
+      if (localProfile) profile = { display_name: localProfile.displayName, avatar_url: localProfile.avatar };
+    }
+    if (!profile && profileResult.status === "fulfilled") {
+      const localProfile = loadAuthorProfileForScope(scope) || normalizeAuthorProfile({ displayName: user.email?.split("@")[0] });
+      profile = await api.upsertProfile(localProfile, { session });
+    }
+    const failedAssets = projects[0] ? await hydrateCloudProjectOnce(projects[0]) : 0;
+    if (cloudState.user?.id !== user.id) return;
+    await activateWorkspaceScope(scope, projects, profile);
+    if (pendingProfile) {
+      cloudState.profileAvatarUrl = remoteAvatar;
+      scheduleCloudProfileSync({ uploadAvatar: pendingProfile.avatar });
+    }
+    if (projectsResult.status === "rejected") throw projectsResult.reason;
+    if (profileResult.status === "rejected") throw profileResult.reason;
+    if (conflict) {
+      githubSyncNotice("另一设备已修改稿件：云端版本保持原名，本机内容已另存为「本机冲突副本」，可在历史记录中分别打开。", true);
+    } else if (failedAssets) {
+      githubSyncNotice("部分素材暂未下载成功，仓库原件仍然保留；请恢复网络后重新打开稿件。", true);
+    } else {
+      githubSyncNotice("已读取 GitHub 私有仓库；稿件和原始素材会自动同步。");
+      setAccountNotice("");
+    }
+    scheduleGitHubProjectSync();
+  } catch (error) {
+    if (cloudState.user?.id !== user.id) return;
+    if (activeStorageScope !== scope) await activateWorkspaceScope(scope, cached.projects);
+    githubSyncNotice(`GitHub 未同步：${error?.message || "存储暂不可达"}。已打开本机缓存，请恢复网络后重试。`, true);
+    setAccountNotice(error?.message || "GitHub 存储暂不可达，已保留本机缓存。", "error");
+  } finally {
+    if (cloudState.loadingUserId === user.id) cloudState.loadingUserId = "";
     setAccountBusy(false);
     updateAccountUi();
   }
@@ -3066,6 +3425,7 @@ async function signInAccount() {
   setAccountNotice("正在登录…");
   const addingAccount = accountAuthAddMode;
   try {
+    if (githubStorageEnabled() && cloudState.user) await waitForCloudSyncBeforeAccountSwitch();
     const result = await cloudApi().signIn(email, password);
     await handleCloudSession(result.session);
     localStorage.setItem(LAST_ACCOUNT_EMAIL_KEY, email);
@@ -3105,6 +3465,7 @@ async function signUpAccount() {
   setAccountNotice("正在创建账号…");
   const addingAccount = accountAuthAddMode;
   try {
+    if (githubStorageEnabled() && cloudState.user) await waitForCloudSyncBeforeAccountSwitch();
     const result = await cloudApi().signUp(email, password);
     localStorage.setItem(LAST_ACCOUNT_EMAIL_KEY, email);
     if (result.session) {
@@ -3247,6 +3608,7 @@ async function signOutAccount() {
   setAccountBusy(true);
   cloudState.signingOut = true;
   try {
+    if (githubStorageEnabled()) await waitForCloudSyncBeforeAccountSwitch();
     document.body.classList.add("entry-choice-pending");
     await cloudApi().signOutLocal();
     await handleCloudSession(null);
@@ -3267,6 +3629,10 @@ async function signOutAccount() {
 function scheduleCloudProfileSync(options = {}) {
   if (!cloudIsReady() || cloudState.loadingWorkspace) return;
   cloudState.pendingAvatarUpload ||= Boolean(options.uploadAvatar);
+  if (githubStorageEnabled()) {
+    cloudState.pendingProfileSync = true;
+    try { localStorage.setItem(githubProfilePendingKey(), JSON.stringify({ avatar: cloudState.pendingAvatarUpload })); } catch { /* Keep the in-memory dirty marker. */ }
+  }
   window.clearTimeout(cloudState.profileTimer);
   cloudState.profileTimer = window.setTimeout(() => {
     cloudState.profileTimer = 0;
@@ -3275,6 +3641,7 @@ function scheduleCloudProfileSync(options = {}) {
 }
 
 async function flushCloudProfileSync() {
+  if (githubStorageEnabled()) return flushGitHubProfileSync();
   if (!cloudIsReady() || cloudState.loadingWorkspace || cloudState.syncingProfile) return;
   cloudState.syncingProfile = true;
   const shouldUploadAvatar = cloudState.pendingAvatarUpload;
@@ -3302,6 +3669,40 @@ async function flushCloudProfileSync() {
   }
 }
 
+async function flushGitHubProfileSync() {
+  if (!cloudIsReady() || cloudState.loadingWorkspace || cloudState.syncingProfile) return;
+  const session = cloudState.session;
+  const scope = activeStorageScope;
+  const shouldUploadAvatar = cloudState.pendingAvatarUpload;
+  const displayName = els.displayName.value.trim() || "未命名作者";
+  cloudState.pendingAvatarUpload = false;
+  cloudState.syncingProfile = true;
+  try {
+    if (shouldUploadAvatar) await updateAvatarPreview();
+    if (cloudState.user?.id !== session.user.id || activeStorageScope !== scope) return;
+    const avatarUrl = shouldUploadAvatar ? els.avatarPreview?.src || state.avatar : cloudState.profileAvatarUrl;
+    const fingerprint = JSON.stringify({ displayName, avatarUrl: avatarUrl || "" });
+    const profile = githubProfileFingerprints.get(scope) === fingerprint
+      ? { avatar_url: avatarUrl || "" }
+      : await cloudApi().upsertProfile({ displayName, avatarUrl: avatarUrl || "" }, { session });
+    if (cloudState.user?.id !== session.user.id || activeStorageScope !== scope) return;
+    cloudState.profileAvatarUrl = profile.avatar_url || avatarUrl || "";
+    githubProfileFingerprints.set(scope, fingerprint);
+    const changedDuringUpload = (els.displayName.value.trim() || "未命名作者") !== displayName || cloudState.pendingAvatarUpload;
+    cloudState.pendingProfileSync = changedDuringUpload;
+    if (!changedDuringUpload) {
+      try { localStorage.removeItem(githubProfilePendingKey(scope)); } catch { /* The next load can safely retry the same profile. */ }
+    }
+    updateAccountUi();
+  } catch (error) {
+    if (cloudState.user?.id === session.user.id && activeStorageScope === scope) {
+      cloudState.pendingProfileSync = true;
+      cloudState.pendingAvatarUpload ||= shouldUploadAvatar;
+      githubSyncNotice(`账号资料未同步：${error?.message || "网络暂不可用"}。本机资料已保留。`, true);
+    }
+  } finally { cloudState.syncingProfile = false; }
+}
+
 async function importLocalProjectsToAccount() {
   if (!cloudState.user || !cloudState.localImportProjects.length) return;
   // 草稿改为本机保存后，导入就是并进这个账号在本机的历史记录，不经过云端。
@@ -3311,7 +3712,7 @@ async function importLocalProjectsToAccount() {
   const incoming = cloudState.localImportProjects.filter((project) => !existing.has(project.id));
   state.projects = [...incoming, ...state.projects.filter((project) => !isBuiltInProject(project))]
     .sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0))
-    .slice(0, MAX_PROJECTS);
+    .slice(0, githubStorageEnabled() ? undefined : MAX_PROJECTS);
   saveProjectStore();
   updateProjectHistory();
   cloudState.localImportProjects = [];
@@ -3412,7 +3813,7 @@ function loadProjectStore() {
     if (raw) {
       const parsed = JSON.parse(raw);
       const projects = Array.isArray(parsed.projects)
-        ? parsed.projects.map(normalizeProject).filter(Boolean).slice(0, MAX_PROJECTS)
+        ? parsed.projects.map(normalizeProject).filter(Boolean).slice(0, githubStorageEnabled() ? undefined : MAX_PROJECTS)
         : [];
       const activeId = isBuiltInProjectId(parsed.activeId)
         ? parsed.activeId
@@ -3445,6 +3846,9 @@ function normalizeProject(project) {
     createdAtUnknown: project.createdAtUnknown === true,
     updatedAt,
     data,
+    ...(project.cloudRevision ? { cloudRevision: project.cloudRevision } : {}),
+    ...(Number.isFinite(project.cloudSyncedAt) ? { cloudSyncedAt: project.cloudSyncedAt } : {}),
+    ...(project.cloudConflictCopy || String(project.title || "").endsWith(" · 本机冲突副本") ? { cloudConflictCopy: true } : {}),
   };
 }
 
@@ -3455,10 +3859,11 @@ function saveProjectStore() {
       activeId: state.currentProjectId,
       projects: state.projects
         .filter((project) => !isBuiltInProject(project))
-        .slice(0, MAX_PROJECTS)
+        .slice(0, githubStorageEnabled() ? undefined : MAX_PROJECTS)
         .map((project) => ({ ...project, data: withExternalizedImages(project.data, project.id) })),
     }),
   );
+  scheduleGitHubProjectSync();
 }
 
 function projectTitleFromData(data) {
@@ -3559,18 +3964,27 @@ async function openProject(projectId) {
   saveState();
   const project = findHistoryProject(projectId);
   if (!project) return;
+  const openingScope = activeStorageScope;
+  let failedAssets = 0;
   // 后台预载可能还没轮到这个项目：打开前把缺的云端素材补齐（幂等，已就绪时立即返回）
   if (cloudIsReady() && !isBuiltInProject(project)) {
-    await hydrateCloudProjectOnce(project).catch(() => undefined);
+    failedAssets = await hydrateCloudProjectOnce(project).catch(() => 1);
   }
-  state.currentProjectId = project.id;
-  applyForm(project.data);
-  syncGuideReadOnlyMode();
-  if (isBuiltInProject(project)) saveProjectStore();
-  resetTextHistory();
-  updateProjectHistory();
-  await render();
+  if (githubStorageEnabled() && activeStorageScope !== openingScope) return;
+  if (githubStorageEnabled()) githubProjectSync.readingProject = true;
+  try {
+    state.currentProjectId = project.id;
+    applyForm(project.data);
+    syncGuideReadOnlyMode();
+    if (isBuiltInProject(project)) saveProjectStore();
+    resetTextHistory();
+    updateProjectHistory();
+    await render();
+    rememberGitHubFormSnapshot();
+    if (githubStorageEnabled()) saveProjectStore();
+  } finally { githubProjectSync.readingProject = false; }
   els.status.textContent = isBuiltInProject(project) ? `已打开内置说明书：${project.title}` : `已打开：${project.title || "未命名图文"}`;
+  if (githubStorageEnabled() && failedAssets) githubSyncNotice("部分素材未下载成功；仓库原件仍然保留，请恢复网络后重新打开稿件。", true);
 }
 
 async function deleteProject(projectId) {
@@ -3580,6 +3994,7 @@ async function deleteProject(projectId) {
   }
   const project = state.projects.find((item) => item.id === projectId);
   if (!project) return;
+  if (githubStorageEnabled() && cloudState.user && !(await deleteGitHubProject(project))) return;
   const liveKeys = Object.entries(project.data?.images || {})
     .filter(([, image]) => image?.kind === "live")
     .map(([id, image]) => String(image.videoKey || id));
@@ -3634,7 +4049,7 @@ async function createNewProject() {
     && !window.confirm("游客模式没有历史入口。新建后，当前稿将无法从页面找回；请先从右侧下载菜单保存可编辑原稿。确定新建吗？")) return;
   saveState();
   const project = createProject(blankFormState());
-  state.projects = [project, ...state.projects.filter((item) => item.id !== project.id)].slice(0, MAX_PROJECTS);
+  state.projects = [project, ...state.projects.filter((item) => item.id !== project.id)].slice(0, githubStorageEnabled() ? undefined : MAX_PROJECTS);
   state.currentProjectId = project.id;
   applyForm(project.data);
   syncGuideReadOnlyMode();
@@ -5501,7 +5916,7 @@ async function inspectPortableProject(read, paths) {
 }
 
 async function importPortableProject({ read, source, listed }) {
-  if (activeStorageScope !== "guest" && state.projects.length >= MAX_PROJECTS) {
+  if (!githubStorageEnabled() && activeStorageScope !== "guest" && state.projects.length >= MAX_PROJECTS) {
     throw new Error(`这台设备已有 ${MAX_PROJECTS} 篇稿件，请先备份并整理旧稿，再导入。`);
   }
   const imported = createProject(source.data);
@@ -10179,7 +10594,11 @@ async function applyLivePhotoAsset(event) {
   try {
     const editing = Boolean(livePhotoState.editingId);
     const id = livePhotoState.editingId || createImportedImageId();
-    const videoKey = String(state.images[id]?.videoKey || id);
+    const previousVideoKey = String(state.images[id]?.videoKey || id);
+    // A key bound to a repository path represents immutable bytes. Local edits get
+    // their own key so conflict recovery can still reopen the original cloud video.
+    const videoKey = githubStorageEnabled() && previousVideoKey.startsWith("github:")
+      ? `github-local:${crypto.randomUUID()}` : previousVideoKey;
     const cover = await captureLivePhotoCover();
     const settings = normalizeLiveMediaSettings({
       duration: livePhotoState.duration,
@@ -13418,6 +13837,11 @@ syncGuideReadOnlyMode();
 resetTextHistory();
 updateProjectHistory();
 bindEvents();
+window.addEventListener("online", () => {
+  if (!githubStorageEnabled()) return;
+  scheduleGitHubProjectSync();
+  if (cloudState.pendingProfileSync) scheduleCloudProfileSync();
+});
 void loadObsidianVaultConnection();
 void initializeCloudAccount();
 if (window.lucide) {

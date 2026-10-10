@@ -5,6 +5,14 @@
   "private": true,
   "scripts": {
     "open": "open index.html",
-    "start": "python3 server.py"
+    "start": "python3 server.py",
+    "test": "node scripts/test.mjs",
+    "build:cloudflare": "node scripts/build_cloudflare.mjs",
+    "dev:cloudflare": "wrangler dev",
+    "deploy:cloudflare": "wrangler deploy"
+  },
+  "devDependencies": {
+    "miniflare": "5.20261006.1-alpha",
+    "wrangler": "4.149.0"
   }
 }

@@ -10,6 +10,7 @@ function section(start,end) {
 const storage=new Map(),entries=[],notices=[];
 let signups=0,migrations=0,loads=0;
 const ctx={
+  githubStorageEnabled: () => false,
   ACCOUNT_MAINTENANCE:true, accountAuthAddMode:false, MIGRATION_AUTH_PENDING_KEY:'migration-pending',
   LAST_ACCOUNT_EMAIL_KEY:'last-email', ENTRY_MODE_SESSION_KEY:'entry',
   cloudState:{user:null},els:{accountEmail:{value:'new@example.com'},accountPassword:{value:'example-password'},accountPasswordConfirm:{value:'example-password'}},

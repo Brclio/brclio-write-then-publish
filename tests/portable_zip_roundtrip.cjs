@@ -37,6 +37,7 @@ const imageStore = new Map(), videoStore = new Map(), liveMediaFiles = new Map()
 const state = { projects: [], currentProjectId: null };
 let cloudCalls = 0, nextId = 0;
 const ctx = {
+  githubStorageEnabled: () => false,
   Blob, fetch, Date, JSON, String, Number, Object, Map, Error,
   state, liveMediaFiles, activeStorageScope: 'guest', MAX_PROJECTS: 24,
   window: { JSZip: BrowserZip }, cloudState: { user: null }, els: { status: {} },

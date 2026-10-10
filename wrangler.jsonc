@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "brclio-write-then-publish",
+  "main": "cloudflare/worker.mjs",
+  "compatibility_date": "2026-10-10",
+  "keep_vars": true,
+  "ratelimits": [{
+    "name": "AUTH_RATE_LIMIT",
+    "namespace_id": "1001",
+    "simple": { "limit": 10, "period": 60 }
+  }],
+  "assets": {
+    "directory": "./dist/cloudflare",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "build": { "command": "npm run build:cloudflare" }
+}

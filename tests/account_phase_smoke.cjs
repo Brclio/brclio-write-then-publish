@@ -22,6 +22,7 @@ const els = {
   migrationTestEmail: { value: 'old@example.com' }, migrationTestPassword: { value: 'secret' },
 };
 const ctx = {
+  githubStorageEnabled: () => false,
   LOCAL_DEPLOYMENT_MODE: false, ACCOUNT_MAINTENANCE: false,
   MIGRATION_END_AT: cutoff, URLSearchParams, cloudState: { user: { id: 'owner' } },
   ACCOUNT_SESSIONS_STORAGE_KEY: 'sessions', LAST_ACCOUNT_EMAIL_KEY: 'last-email', ENTRY_MODE_SESSION_KEY: 'entry',

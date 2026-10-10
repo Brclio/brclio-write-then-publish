@@ -1,4 +1,6 @@
 (function initializeWriteThenPublishCloud() {
+  // Cloudflare 的可选 GitHub 模式已提供独立认证与存储；配置错误也不能回退到另一套账号。
+  if (window.WRITE_THEN_PUBLISH_STORAGE) return;
   const config = window.WRITE_THEN_PUBLISH_SUPABASE || {};
   const url = String(config.url || "").trim().replace(/\/$/, "");
   const publishableKey = String(config.publishableKey || "").trim();

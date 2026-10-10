@@ -31,6 +31,7 @@ const els = {
 let listProjects = async () => projects;
 let getProfile = async () => ({ display_name: "测试账号" });
 const context = {
+  githubStorageEnabled: () => false,
   ACCOUNT_MAINTENANCE: true, LOCAL_DEPLOYMENT_MODE: false,
   MIGRATION_RECEIPTS_KEY: "migration.test", cloudState, els,
   localStorage: {

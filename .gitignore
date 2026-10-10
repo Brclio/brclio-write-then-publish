@@ -3,3 +3,8 @@ outputs
 .DS_Store
 .vercel
 supabase/.temp/
+dist/
+.wrangler/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
