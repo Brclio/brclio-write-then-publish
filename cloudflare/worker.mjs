@@ -22,12 +22,27 @@ export default {
       assetRequest.headers.delete('If-Modified-Since');
     }
     const response = await env.ASSETS.fetch(assetRequest);
+    if (env.STORAGE_PROVIDER === 'github' && ['/robots.txt', '/sitemap.xml'].includes(url.pathname) && response.status === 200) {
+      const result = new Response((await response.text()).replaceAll('https://fawen.fun', url.origin), response);
+      result.headers.delete('ETag');
+      result.headers.delete('Last-Modified');
+      result.headers.delete('Content-Length');
+      result.headers.delete('Content-Encoding');
+      result.headers.set('Cache-Control', 'no-store');
+      return result;
+    }
     if (env.STORAGE_PROVIDER !== 'github' || !['/', '/index.html'].includes(url.pathname) || url.searchParams.get('mode') === 'local'
         || !response.headers.get('Content-Type')?.includes('text/html') || response.status !== 200) return response;
     // The first inline script loads the existing account adapter. Inserting before
     // it lets the GitHub adapter take ownership without changing the static/local app.
     let inserted = false;
-    const rewritten = new HTMLRewriter().on('script:not([src])', {
+    const rewriter = new HTMLRewriter()
+      .on('link[rel="canonical"]', { element(element) { element.setAttribute('href', `${url.origin}/`); } })
+      .on('meta[property="og:url"]', { element(element) { element.setAttribute('content', `${url.origin}/`); } })
+      .on('meta[property="og:image"], meta[name="twitter:image"]', {
+        element(element) { element.setAttribute('content', `${url.origin}/brand/og-image.png`); },
+      });
+    const rewritten = rewriter.on('script:not([src])', {
       element(element) {
         if (inserted) return;
         inserted = true;

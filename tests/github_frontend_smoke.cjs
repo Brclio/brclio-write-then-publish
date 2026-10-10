@@ -104,8 +104,72 @@ async function testAdapter() {
   await assert.rejects(ctx.window.WriteThenPublishCloud.signIn('a@example.com', 'password123'), /配置错误明细/);
 }
 
+async function testAdapterPagination() {
+  function createAdapter(respond, savedSession = session) {
+    const storage = new Map([['writeThenPublishGitHubSession.v1', JSON.stringify(savedSession)]]);
+    const requests = [];
+    const ctx = { window: { WRITE_THEN_PUBLISH_STORAGE: { provider: 'github' } }, localStorage: {
+      getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key),
+    }, Blob, Headers, Date, fetch: (url, options) => {
+      requests.push({ url, options });
+      return respond(url, options);
+    } };
+    vm.createContext(ctx); vm.runInContext(adapter, ctx);
+    return { api: ctx.window.WriteThenPublishCloud, requests };
+  }
+
+  const firstCursor = 'snapshot+page/2=';
+  const secondCursor = 'snapshot+page/3=';
+  const nextSession = { ...session, access_token: 'user-b-token', user: { id: 'b', email: 'b@example.com' } };
+  let releaseFirstPage;
+  let page = 0;
+  const paginated = createAdapter(async (url) => {
+    if (url.endsWith('/auth/signup')) return Response.json({ session: nextSession, user: nextSession.user });
+    page++;
+    if (page === 1) return new Promise(resolve => { releaseFirstPage = () => resolve(Response.json({ projects: [{ id: 'one' }], next_cursor: firstCursor })); });
+    if (page === 2) return Response.json({ projects: [{ id: 'two' }], next_cursor: secondCursor });
+    return Response.json({ projects: [{ id: 'three' }], next_cursor: null });
+  });
+  const listing = paginated.api.listProjects();
+  assert.equal(page, 1, 'only one page is requested until its response arrives');
+  await paginated.api.signUp('b@example.com', 'password123', '123456');
+  releaseFirstPage();
+  assert.equal(JSON.stringify(await listing), JSON.stringify([{ id: 'one' }, { id: 'two' }, { id: 'three' }]), 'all pages are returned together in order');
+  const pageRequests = paginated.requests.filter(item => item.url.includes('/projects?'));
+  assert.deepEqual(pageRequests.map(item => item.url), [
+    '/api/storage/projects?limit=8',
+    `/api/storage/projects?cursor=${encodeURIComponent(firstCursor)}`,
+    `/api/storage/projects?cursor=${encodeURIComponent(secondCursor)}`,
+  ]);
+  assert.ok(pageRequests.every(item => item.options.headers.get('Authorization') === 'Bearer user-a-token'), 'changing accounts during pagination cannot mix workspace sessions');
+
+  const explicit = createAdapter(async () => Response.json({ projects: [], next_cursor: null }));
+  assert.equal((await explicit.api.listProjects({ session: { ...session, access_token: 'bound-project-token' } })).length, 0);
+  assert.equal(explicit.requests[0].options.headers.get('Authorization'), 'Bearer bound-project-token');
+  await explicit.api.listProjects({ session: null });
+  assert.equal(explicit.requests[1].options.headers.has('Authorization'), false, 'an explicitly empty session stays empty');
+
+  const legacy = createAdapter(async () => Response.json([{ id: 'legacy' }]));
+  assert.equal(JSON.stringify(await legacy.api.listProjects()), JSON.stringify([{ id: 'legacy' }]), 'older server array responses remain compatible');
+  assert.equal(legacy.requests.length, 1);
+
+  let failedPage = 0;
+  const expired = createAdapter(async () => ++failedPage === 1
+    ? Response.json({ projects: [{ id: 'partial' }], next_cursor: firstCursor })
+    : Response.json({ error: '列表快照已过期，请重新加载。', code: 'cursor_expired' }, { status: 410 }));
+  await assert.rejects(expired.api.listProjects(), error => error.status === 410 && error.code === 'cursor_expired', 'a page failure rejects the whole list instead of returning a partial workspace');
+  assert.equal(expired.requests.length, 2);
+
+  const looping = createAdapter(async () => Response.json({ projects: [], next_cursor: firstCursor }));
+  await assert.rejects(looping.api.listProjects(), /分页无效/);
+  assert.equal(looping.requests.length, 2, 'repeated cursors cannot start an endless request loop');
+  const malformed = createAdapter(async () => Response.json({ next_cursor: null }));
+  await assert.rejects(malformed.api.listProjects(), /返回格式错误/, 'malformed responses cannot silently empty a cached workspace');
+}
+
 (async () => {
   await testAdapter();
+  await testAdapterPagination();
   const success = appContext();
   success.ctx.scheduleGitHubProjectSync();
   await success.ctx.flushGitHubProjectSync();
@@ -268,5 +332,5 @@ async function testAdapter() {
   form = { ...form, content: 'actual edit' };
   opening.ctx.saveState();
   assert.equal(opening.sync.pending.size, 1, 'actual edits still schedule project synchronization');
-  console.log('OK: GitHub adapter, disabled config, original GIF/video sync, asset reuse, missing-media failure, conflict preservation, account isolation, deletion ordering and cache merge');
+  console.log('OK: GitHub adapter, snapshot pagination, disabled config, original GIF/video sync, asset reuse, missing-media failure, conflict preservation, account isolation, deletion ordering and cache merge');
 })().catch(error => { console.error(error); process.exitCode = 1; });

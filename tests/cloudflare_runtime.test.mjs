@@ -6,6 +6,8 @@ import { createFakeGitHub, fakeGitHubEnvironment } from './helpers/fake_github.m
 
 const staticHtml = await readFile('index.html', 'utf8');
 const staticCss = await readFile('src/styles.css', 'utf8');
+const staticSitemap = await readFile('sitemap.xml', 'utf8');
+const staticRobots = await readFile('robots.txt', 'utf8');
 const modules = await Promise.all(['worker.mjs', 'github-storage.mjs', 'smtp.mjs'].map(async name => ({
   type: 'ESModule', path: path.resolve('cloudflare', name), contents: await readFile(`cloudflare/${name}`, 'utf8'),
 })));
@@ -30,6 +32,8 @@ async function assets(request) {
   const url = new URL(request.url);
   if (url.pathname === '/' || url.pathname === '/index.html') return new Response(staticHtml, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   if (url.pathname === '/src/styles.css') return new Response(staticCss, { headers: { 'Content-Type': 'text/css' } });
+  if (url.pathname === '/sitemap.xml') return new Response(staticSitemap, { headers: { 'Content-Type': 'application/xml' } });
+  if (url.pathname === '/robots.txt') return new Response(staticRobots, { headers: { 'Content-Type': 'text/plain' } });
   return new Response('Not found', { status: 404 });
 }
 
@@ -42,6 +46,8 @@ const runtime = new Miniflare(convertV4MiniflareOptions({
 try {
   const response = await runtime.dispatchFetch('https://app.example/');
   assert.equal(await response.text(), staticHtml, 'disabled deployment returns the original page byte for byte');
+  assert.equal(await (await runtime.dispatchFetch('https://app.example/sitemap.xml')).text(), staticSitemap);
+  assert.equal(await (await runtime.dispatchFetch('https://app.example/robots.txt')).text(), staticRobots);
   await runtime.setOptions(convertV4MiniflareOptions({
     name: 'storage-runtime-test',
     modules,
@@ -63,7 +69,13 @@ try {
   const html = await (await runtime.dispatchFetch('https://app.example/')).text();
   assert.match(html, /src="\/api\/storage\/config.js"/);
   assert.match(html, /src="\/src\/github-storage.js"/);
-  assert.equal(html.replace('<script src="/api/storage/config.js"></script><script src="/src/github-storage.js"></script>', ''), staticHtml);
+  assert.equal(html.replace('<script src="/api/storage/config.js"></script><script src="/src/github-storage.js"></script>', ''), staticHtml.replaceAll('https://fawen.fun', 'https://app.example'));
+  assert.match(html, /rel="canonical" href="https:\/\/app\.example\/"/);
+  assert.match(html, /property="og:url" content="https:\/\/app\.example\/"/);
+  assert.match(html, /property="og:image" content="https:\/\/app\.example\/brand\/og-image\.png"/);
+  assert.match(html, /name="twitter:image" content="https:\/\/app\.example\/brand\/og-image\.png"/);
+  assert.equal(await (await runtime.dispatchFetch('https://app.example/sitemap.xml')).text(), staticSitemap.replaceAll('https://fawen.fun', 'https://app.example'));
+  assert.equal(await (await runtime.dispatchFetch('https://app.example/robots.txt')).text(), staticRobots.replaceAll('https://fawen.fun', 'https://app.example'));
   assert.equal(await (await runtime.dispatchFetch('https://app.example/?mode=local')).text(), staticHtml);
   assert.equal(await (await runtime.dispatchFetch('https://app.example/src/styles.css')).text(), staticCss);
   const config = await runtime.dispatchFetch('https://app.example/api/storage/config.js');
@@ -126,9 +138,78 @@ try {
   const stillReadable = await runtime.dispatchFetch('https://app.example/api/storage/projects', { headers });
   assert.equal(stillReadable.status, 200, 'mail outage does not interrupt existing users');
   assert.equal((await stillReadable.json())[0].data.content, '# Markdown 正文');
+  // The account adapter uses bounded pages so a 24-draft workspace fits the
+  // Workers Free limit on every incoming request rather than one large list.
+  for (let index = 1; index < 24; index++) {
+    const draft = await runtime.dispatchFetch(`https://app.example/api/storage/projects/page-draft-${index}`, {
+      method: 'PUT', headers, body: JSON.stringify({ title: `分页稿件 ${index}`, data: { content: `# 不同正文 ${index}`, images: {} } }),
+    });
+    assert.equal(draft.status, 200, await draft.clone().text());
+  }
+  const userRoot = `write-then-publish/users/${session.user.id}`;
+  const expectedIndex = github.json(`${userRoot}/projects/index.json`).projects;
+  assert.equal(expectedIndex.length, 24);
+  const expectedRows = new Map(expectedIndex.map(project => [project.id, {
+    ...github.json(`${userRoot}/projects/${project.id}/project.json`),
+    content: github.text(`${userRoot}/projects/${project.id}/content.md`),
+  }]));
+  const pageRequestCounts = [];
+  async function readPage(cursor) {
+    const before = github.requests.length;
+    const url = cursor ? `https://app.example/api/storage/projects?cursor=${encodeURIComponent(cursor)}` : 'https://app.example/api/storage/projects?limit=8';
+    const response = await runtime.dispatchFetch(url, { headers });
+    assert.equal(response.status, 200, await response.clone().text());
+    const page = await response.json();
+    assert.ok(Array.isArray(page.projects));
+    assert.ok(page.projects.length <= 8);
+    assert.ok(page.next_cursor === null || typeof page.next_cursor === 'string');
+    const count = github.requests.length - before;
+    assert.ok(count < 50, `each page must fit Workers Free: observed ${count} GitHub fetches`);
+    pageRequestCounts.push(count);
+    return page;
+  }
+  const firstPage = await readPage();
+  assert.equal(firstPage.projects.length, 8);
+  assert.equal(typeof firstPage.next_cursor, 'string');
+  const oldCursor = firstPage.next_cursor;
+  const edited = expectedIndex[10];
+  const deleted = expectedIndex[18];
+  const update = await runtime.dispatchFetch(`https://app.example/api/storage/projects/${edited.id}`, {
+    method: 'PUT', headers, body: JSON.stringify({ title: '分页途中更新', data: { content: '# 分页之后的新版本', images: {} }, revision: edited.revision }),
+  });
+  assert.equal(update.status, 200, await update.clone().text());
+  const deletion = await runtime.dispatchFetch(`https://app.example/api/storage/projects/${deleted.id}`, {
+    method: 'DELETE', headers, body: JSON.stringify({ revision: deleted.revision }),
+  });
+  assert.equal(deletion.status, 200, await deletion.clone().text());
+  const insertion = await runtime.dispatchFetch('https://app.example/api/storage/projects/inserted-during-pagination', {
+    method: 'PUT', headers, body: JSON.stringify({ title: '分页途中插入', data: { content: '# 下一轮同步可见', images: {} } }),
+  });
+  assert.equal(insertion.status, 200, await insertion.clone().text());
+  const rows = [...firstPage.projects];
+  let cursor = oldCursor;
+  while (cursor) {
+    const page = await readPage(cursor);
+    rows.push(...page.projects);
+    cursor = page.next_cursor;
+    assert.ok(pageRequestCounts.length <= 3, '24 drafts complete in exactly three pages');
+  }
+  assert.equal(rows.length, 24);
+  assert.equal(new Set(rows.map(project => project.id)).size, 24);
+  assert.deepEqual(rows.map(project => project.id), expectedIndex.map(project => project.id), 'insert/edit/delete between pages never skip, duplicate, or change snapshot rows');
+  for (const project of rows) {
+    const expected = expectedRows.get(project.id);
+    assert.equal(project.title, expected.title);
+    assert.equal(project.revision, expected.revision);
+    assert.equal(project.data.content, expected.content);
+  }
+  const signout = await runtime.dispatchFetch('https://app.example/api/storage/auth/signout', { method: 'POST', headers });
+  assert.equal(signout.status, 200, await signout.clone().text());
+  const revokedPage = await runtime.dispatchFetch(`https://app.example/api/storage/projects?cursor=${encodeURIComponent(oldCursor)}`, { headers });
+  assert.equal(revokedPage.status, 401, 'a signed old snapshot cursor cannot bypass current account session revocation');
   assert.equal(await (await runtime.dispatchFetch('https://app.example/?mode=local')).text(), staticHtml);
   assert.equal(await (await runtime.dispatchFetch('https://app.example/src/styles.css')).text(), staticCss);
-  console.log('OK: workerd email code, verified registration/login/save/read and mail outage; HTML injection, local/default modes and CSS unchanged; config contains no secrets');
+  console.log(`OK: workerd email code, verified registration/login/save/read and mail outage; 24-draft stable pages use ${pageRequestCounts.join('/')} GitHub fetches and reject revoked sessions; HTML injection, local/default modes and CSS unchanged; config contains no secrets`);
 } finally {
   await runtime.dispose();
 }

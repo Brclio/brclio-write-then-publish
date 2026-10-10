@@ -13,6 +13,8 @@ const VERIFICATION_SECONDS = 10 * 60;
 const VERIFICATION_COOLDOWN = 60;
 const VERIFICATION_ATTEMPTS = 5;
 const VERIFICATION_SENDS_PER_HOUR = 6;
+const PROJECT_PAGE_SIZE = 8;
+const PROJECT_CURSOR_SECONDS = 15 * 60;
 const authAttempts = new Map();
 
 export class StorageError extends Error {
@@ -176,6 +178,40 @@ async function verifySession(request, env) {
   } catch { fail(401, '登录已失效，请重新登录。', 'unauthorized'); }
 }
 
+async function projectPagination(url, env, identity) {
+  const limit = url.searchParams.get('limit');
+  const cursor = url.searchParams.get('cursor');
+  if (limit === null && cursor === null) return null; // Preserve the original all-project API.
+  if (url.searchParams.getAll('limit').length > 1 || url.searchParams.getAll('cursor').length > 1
+      || (cursor !== null && limit !== null)) fail(400, '稿件分页参数无效。', 'invalid_cursor');
+  if (cursor === null) {
+    if (!/^[1-8]$/.test(limit)) fail(400, '每页稿件数量应为 1 至 8。', 'invalid_cursor');
+    return { limit: Number(limit), offset: 0 };
+  }
+  let payload;
+  try {
+    if (!cursor || cursor.length > 1536 || !/^[A-Za-z0-9_.-]+$/.test(cursor)) throw new Error();
+    const [body, signature, extra] = cursor.split('.');
+    if (!body || !signature || extra) throw new Error();
+    if (!await crypto.subtle.verify('HMAC', await hmacKey(env), unbase64url(signature), encoder.encode(`project-page\0${body}`))) throw new Error();
+    payload = JSON.parse(decoder.decode(unbase64url(body)));
+    if (!object(payload) || payload.v !== 1 || payload.sub !== identity.payload.sub || payload.jti !== identity.payload.jti
+        || typeof payload.commit !== 'string' || !/^[a-f0-9]{40}$/.test(payload.commit)
+        || !Number.isSafeInteger(payload.offset) || payload.offset < 1 || payload.offset > 1000
+        || !Number.isSafeInteger(payload.limit) || payload.limit < 1 || payload.limit > PROJECT_PAGE_SIZE
+        || payload.offset % payload.limit !== 0 || !Number.isSafeInteger(payload.exp)) throw new Error();
+  } catch { fail(400, '稿件分页凭证无效，请重新读取稿件。', 'invalid_cursor'); }
+  if (payload.exp <= Math.floor(Date.now() / 1000)) fail(410, '稿件分页已过期，请重新读取稿件。', 'cursor_expired');
+  return payload;
+}
+
+async function nextProjectCursor(env, identity, snapshot, offset, limit) {
+  const payload = { v: 1, sub: identity.payload.sub, jti: identity.payload.jti, commit: snapshot.head, offset, limit, exp: Math.floor(Date.now() / 1000) + PROJECT_CURSOR_SECONDS };
+  const body = base64url(encoder.encode(JSON.stringify(payload)));
+  const signature = new Uint8Array(await crypto.subtle.sign('HMAC', await hmacKey(env), encoder.encode(`project-page\0${body}`)));
+  return `${body}.${base64url(signature)}`;
+}
+
 // A snapshot pins every read to one commit; retries rebuild changes on the newest
 // tree rather than overwriting another user's writes with a stale snapshot.
 export class GitHubRepository {
@@ -219,8 +255,11 @@ export class GitHubRepository {
       this.verified = true;
     }
     const reference = await this.api(`/git/ref/heads/${this.branch.split('/').map(encodeURIComponent).join('/')}`);
-    const commit = await this.api(`/git/commits/${reference.object.sha}`);
-    return { head: reference.object.sha, root: commit.tree.sha, trees: new Map(), blobs: new Map() };
+    return this.snapshotAt(reference.object.sha);
+  }
+  async snapshotAt(head) {
+    const commit = await this.api(`/git/commits/${head}`);
+    return { head, root: commit.tree.sha, trees: new Map(), blobs: new Map() };
   }
   tree(snapshot, sha, recursive = false) {
     const key = `${sha}:${recursive}`;
@@ -423,6 +462,7 @@ export async function handleStorageRequest(request, env, fetcher = fetch, servic
       return responseJson({ session, user: session.user });
     }
     const identity = await verifySession(request, env);
+    const pagination = route === '/projects' && request.method === 'GET' ? await projectPagination(url, env, identity) : null;
     const root = userRoot(repository, identity.payload.sub);
     if (route === '/auth/signout' && request.method === 'POST') {
       await repository.write('Revoke writing account session', async snapshot => {
@@ -510,13 +550,23 @@ export async function handleStorageRequest(request, env, fetcher = fetch, servic
     if (route === '/auth/session' && request.method === 'GET') return responseJson({ session: { access_token: identity.token, refresh_token: identity.token, expires_at: identity.payload.exp, user: { id: account.id, email: account.email } } });
     if (route === '/profile' && request.method === 'GET') return responseJson(await repository.json(snapshot, `${root}/profile.json`, { user_id: account.id, display_name: '', avatar_url: '' }));
     if (route === '/projects' && request.method === 'GET') {
-      const index = await repository.json(snapshot, `${root}/projects/index.json`, { projects: [] });
-      const rows = await mapLimited(index.projects, async metadata => {
+      // Authorization above always uses the current HEAD, including revocations.
+      // Only project reads may use the earlier, signed and user-bound snapshot.
+      const projectSnapshot = pagination?.commit && pagination.commit !== snapshot.head ? await repository.snapshotAt(pagination.commit) : snapshot;
+      const index = await repository.json(projectSnapshot, `${root}/projects/index.json`, { projects: [] });
+      if (!Array.isArray(index.projects) || index.projects.length > 1000) fail(503, '稿件索引格式或数量无效，请联系部署管理员。', 'invalid_repository_data');
+      const metadata = pagination ? index.projects.slice(pagination.offset, pagination.offset + pagination.limit) : index.projects;
+      const rows = await mapLimited(metadata, async metadata => {
         const base = projectBase(root, metadata.id);
-        const [row, bytes] = await Promise.all([repository.json(snapshot, `${base}/project.json`), repository.bytes(snapshot, `${base}/content.md`)]);
+        const [row, bytes] = await Promise.all([repository.json(projectSnapshot, `${base}/project.json`), repository.bytes(projectSnapshot, `${base}/content.md`)]);
         if (!row || !bytes) fail(503, '项目文件缺失，请联系部署管理员。', 'invalid_repository_data');
         return { ...row, data: { ...row.data, content: decoder.decode(bytes) } };
       });
+      if (pagination) {
+        const offset = pagination.offset + metadata.length;
+        const cursor = offset < index.projects.length ? await nextProjectCursor(env, identity, projectSnapshot, offset, pagination.limit) : null;
+        return responseJson({ projects: rows, next_cursor: cursor });
+      }
       return responseJson(rows);
     }
     if (route === '/assets' && request.method === 'GET') {

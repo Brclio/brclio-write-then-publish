@@ -79,6 +79,25 @@
     if (session === current) rememberSession(null, "SIGNED_OUT");
   }
 
+  async function listProjects(options = {}) {
+    // One workspace read keeps its account and Git snapshot across every page.
+    const boundOptions = { ...options, session: options.session === undefined ? session : options.session };
+    const projects = [];
+    const cursors = new Set();
+    let path = "/projects?limit=8";
+    while (true) {
+      const result = await request(path, boundOptions);
+      if (Array.isArray(result)) return projects.concat(result);
+      if (!Array.isArray(result?.projects)) throw new Error("GitHub 稿件列表返回格式错误，请重试。");
+      projects.push(...result.projects);
+      const cursor = result.next_cursor;
+      if (cursor === undefined || cursor === null || cursor === "") return projects;
+      if (typeof cursor !== "string" || cursors.has(cursor)) throw new Error("GitHub 稿件列表分页无效，请重试。");
+      cursors.add(cursor);
+      path = `/projects?cursor=${encodeURIComponent(cursor)}`;
+    }
+  }
+
   window.WriteThenPublishCloud = {
     provider: "github", configured, supportsProjectSync: true, livePhotoConfigured: false,
     configurationError: configured ? "" : config.configurationError || config.error || "GitHub 私有仓库存储尚未配置，请联系站点管理员。",
@@ -99,7 +118,7 @@
     }),
     // The private avatar is part of the authenticated profile, so an <img> needs no public URL.
     uploadAvatar: async (dataUrl) => dataUrl,
-    listProjects: (options) => request("/projects", options).then((result) => Array.isArray(result) ? result : result.projects || []),
+    listProjects,
     saveProject: (project, options = {}) => request(`/projects/${encodeURIComponent(project.id)}`, {
       ...options, method: "PUT", body: {
         title: project.title, data: project.data, revision: project.revision || null,
