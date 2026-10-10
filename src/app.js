@@ -226,6 +226,9 @@ const els = {
   accountPasswordToggle: $("#accountPasswordToggleBtn"),
   accountPasswordConfirmField: $("#accountPasswordConfirmField"),
   accountPasswordConfirm: $("#accountPasswordConfirmInput"),
+  accountSignupCodeField: $("#accountSignupCodeField"),
+  accountSignupCode: $("#accountSignupCodeInput"),
+  accountSendSignupCode: $("#accountSendSignupCodeBtn"),
   accountSignInMode: $("#accountSignInModeBtn"),
   accountSignIn: $("#accountSignInBtn"),
   accountSignUp: $("#accountSignUpBtn"),
@@ -1581,6 +1584,8 @@ function setAccountNotice(message = "", tone = "") {
 
 let accountAuthMode = "signin";
 let accountAuthAddMode = false;
+let accountAuthBusy = false;
+const githubSignupVerification = { email: "", retryAt: 0, timer: 0, sending: false };
 let pendingConfirmationEmail = "";
 
 function accountSessionSnapshot(session) {
@@ -1806,6 +1811,7 @@ function setAccountAuthMode(mode, { keepNotice = false } = {}) {
   accountAuthMode = ["signup", "reset"].includes(mode) ? mode : "signin";
   const signingUp = accountAuthMode === "signup";
   const resetting = accountAuthMode === "reset";
+  if (githubStorageEnabled()) updateGitHubSignupVerificationUi();
   // 改密码时把登录/注册那一套整个藏起来，只留「设置新密码」一个输入框。
   els.accountAuthForm?.classList.toggle("is-resetting", resetting);
   if (els.accountNewPasswordField) els.accountNewPasswordField.hidden = !resetting;
@@ -1869,11 +1875,14 @@ function accountAuthErrorMessage(error, mode) {
 }
 
 function setAccountBusy(busy) {
+  accountAuthBusy = Boolean(busy);
   [
     els.accountEmail,
     els.accountPassword,
     els.accountPasswordToggle,
     els.accountPasswordConfirm,
+    els.accountSignupCode,
+    els.accountSendSignupCode,
     els.accountSignInMode,
     els.accountSignIn,
     els.accountSignUp,
@@ -1886,6 +1895,61 @@ function setAccountBusy(busy) {
     .forEach((element) => {
       element.disabled = busy;
     });
+  if (githubStorageEnabled()) updateGitHubSignupVerificationUi();
+}
+
+function updateGitHubSignupVerificationUi() {
+  const field = els.accountSignupCodeField;
+  if (!field) return;
+  const enabled = githubStorageEnabled() && accountAuthMode === "signup";
+  field.hidden = !enabled;
+  if (els.accountSignupCode) {
+    els.accountSignupCode.required = enabled;
+    if (!enabled) els.accountSignupCode.value = "";
+  }
+  window.clearTimeout(githubSignupVerification.timer);
+  githubSignupVerification.timer = 0;
+  const button = els.accountSendSignupCode;
+  if (!button) return;
+  const email = els.accountEmail.value.trim().toLowerCase();
+  const remaining = email === githubSignupVerification.email
+    ? Math.max(0, Math.ceil((githubSignupVerification.retryAt - Date.now()) / 1000)) : 0;
+  button.disabled = !enabled || !cloudApi()?.configured || accountAuthBusy || githubSignupVerification.sending || remaining > 0;
+  button.textContent = githubSignupVerification.sending ? "…" : remaining ? `${remaining}s` : githubSignupVerification.email === email ? "重发" : "发送";
+  const description = githubSignupVerification.sending ? "正在发送邮箱验证码" : remaining ? `${remaining} 秒后可重新发送邮箱验证码` : "发送邮箱验证码";
+  button.title = description;
+  button.setAttribute("aria-label", description);
+  if (enabled && remaining) githubSignupVerification.timer = window.setTimeout(updateGitHubSignupVerificationUi, 1000);
+}
+
+async function sendGitHubSignupCode() {
+  if (!githubStorageEnabled() || accountAuthMode !== "signup" || githubSignupVerification.sending || accountAuthBusy) return;
+  const email = els.accountEmail.value.trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    setAccountNotice("请先填写有效的注册邮箱。", "error");
+    els.accountEmail.focus();
+    return;
+  }
+  if (githubSignupVerification.email === email && githubSignupVerification.retryAt > Date.now()) return;
+  githubSignupVerification.sending = true;
+  setAccountBusy(true);
+  setAccountNotice("正在发送邮箱验证码…");
+  try {
+    const result = await cloudApi().requestSignupCode(email);
+    githubSignupVerification.email = email;
+    githubSignupVerification.retryAt = Date.now() + Math.max(1, Number(result.retry_after) || 60) * 1000;
+    if (els.accountSignupCode) { els.accountSignupCode.value = ""; els.accountSignupCode.focus(); }
+    setAccountNotice(`验证码已发送到 ${email}，10 分钟内有效。请检查收件箱或垃圾邮件，填写最新验证码后注册。`, "success");
+  } catch (error) {
+    if (error.code === "verification_cooldown") {
+      githubSignupVerification.email = email;
+      githubSignupVerification.retryAt = Date.now() + Math.max(1, error.retryAfter || 60) * 1000;
+    }
+    setAccountNotice(error?.message || "验证码发送失败，请稍后重试。", "error");
+  } finally {
+    githubSignupVerification.sending = false;
+    setAccountBusy(false);
+  }
 }
 
 function updateAccountUi() {
@@ -2742,7 +2806,7 @@ function clearRememberedAccountIdentity() {
   accountAuthAddMode = false;
   accountAuthMode = "signin";
   migrationTestAuthMode = "signin";
-  for (const input of [els.accountEmail, els.accountPassword, els.accountPasswordConfirm, els.accountNewPassword,
+  for (const input of [els.accountEmail, els.accountPassword, els.accountPasswordConfirm, els.accountNewPassword, els.accountSignupCode,
     els.migrationTestEmail, els.migrationTestPassword]) {
     if (input) input.value = "";
   }
@@ -3461,12 +3525,20 @@ async function signUpAccount() {
     els.accountPasswordConfirm.focus();
     return;
   }
+  const verificationCode = githubStorageEnabled() ? String(els.accountSignupCode?.value || "").trim() : "";
+  if (githubStorageEnabled() && !/^\d{6}$/.test(verificationCode)) {
+    setAccountNotice("请先发送邮箱验证码，并填写邮件中的 6 位数字。", "error");
+    els.accountSignupCode?.focus();
+    return;
+  }
   setAccountBusy(true);
   setAccountNotice("正在创建账号…");
   const addingAccount = accountAuthAddMode;
   try {
     if (githubStorageEnabled() && cloudState.user) await waitForCloudSyncBeforeAccountSwitch();
-    const result = await cloudApi().signUp(email, password);
+    const result = githubStorageEnabled()
+      ? await cloudApi().signUp(email, password, verificationCode)
+      : await cloudApi().signUp(email, password);
     localStorage.setItem(LAST_ACCOUNT_EMAIL_KEY, email);
     if (result.session) {
       await handleCloudSession(result.session);
@@ -3489,6 +3561,7 @@ async function signUpAccount() {
     }
     els.accountPassword.value = "";
     els.accountPasswordConfirm.value = "";
+    if (els.accountSignupCode) els.accountSignupCode.value = "";
   } catch (error) {
     setAccountNotice(accountAuthErrorMessage(error, "signup"), "error");
   } finally {
@@ -13678,6 +13751,12 @@ function bindEvents() {
     els.accountPassword.focus();
   });
   els.accountResendConfirmation.addEventListener("click", resendAccountConfirmation);
+  els.accountSendSignupCode?.addEventListener("click", () => void sendGitHubSignupCode());
+  els.accountEmail.addEventListener("input", () => {
+    if (!githubStorageEnabled()) return;
+    if (els.accountSignupCode) els.accountSignupCode.value = "";
+    updateGitHubSignupVerificationUi();
+  });
   els.accountForgotPassword?.addEventListener("click", () => void requestPasswordReset());
   els.accountGoogle?.addEventListener("click", () => void signInWithGoogleAccount());
   els.accountSignOut.addEventListener("click", signOutAccount);

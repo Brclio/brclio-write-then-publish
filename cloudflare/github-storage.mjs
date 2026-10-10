@@ -1,3 +1,5 @@
+import { EmailError, smtpConfiguration, sendVerificationEmail } from './smtp.mjs';
+
 // GitHub credentials and account password hashes stay in the Worker/private repository.
 // Business documents are deliberately readable JSON, Markdown and original media files.
 const encoder = new TextEncoder();
@@ -7,6 +9,10 @@ const JSON_LIMIT = 4 * 1024 * 1024;
 const ASSET_LIMIT = 10 * 1024 * 1024;
 const PASSWORD_ITERATIONS = 100000;
 const SESSION_SECONDS = 30 * 24 * 60 * 60;
+const VERIFICATION_SECONDS = 10 * 60;
+const VERIFICATION_COOLDOWN = 60;
+const VERIFICATION_ATTEMPTS = 5;
+const VERIFICATION_SENDS_PER_HOUR = 6;
 const authAttempts = new Map();
 
 export class StorageError extends Error {
@@ -74,10 +80,16 @@ function constantEqual(a, b) {
 }
 function normalizeCredentials(body) {
   if (!object(body) || typeof body.email !== 'string' || typeof body.password !== 'string') fail(400, '请输入邮箱和密码。', 'invalid_credentials');
-  const email = body.email.trim().toLowerCase();
-  if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) fail(400, '邮箱格式无效。', 'invalid_email');
+  const email = normalizeEmail(body.email);
   if (body.password.length < 8 || body.password.length > 128) fail(400, '密码长度应为 8 至 128 个字符。', 'invalid_password');
   return { email, password: body.password };
+}
+function normalizeEmail(value) {
+  const email = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (email.length > 254 || !/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,63}$/.test(email)) {
+    fail(400, '邮箱格式无效。', 'invalid_email');
+  }
+  return email;
 }
 function throttleAuth(request, email) {
   const key = `${request.headers.get('CF-Connecting-IP') || 'unknown'}:${email}`;
@@ -93,6 +105,52 @@ function throttleAuth(request, email) {
 }
 
 async function hmacKey(env) { return crypto.subtle.importKey('raw', encoder.encode(env.SESSION_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']); }
+function registrationPath(repository, id) { return `${repository.prefix}/registration/${id}.json`; }
+function randomVerificationCode() {
+  let value;
+  do { value = crypto.getRandomValues(new Uint32Array(1))[0]; } while (value >= 4294000000);
+  return String(value % 1000000).padStart(6, '0');
+}
+async function verificationHash(env, email, nonce, code) {
+  const input = encoder.encode(`signup-code\0${email}\0${nonce}\0${code}`);
+  return base64url(new Uint8Array(await crypto.subtle.sign('HMAC', await hmacKey(env), input)));
+}
+async function requestSignupCode(repository, env, email, sendEmail) {
+  smtpConfiguration(env);
+  const id = await sha256(email);
+  const root = userRoot(repository, id);
+  const path = registrationPath(repository, id);
+  const code = randomVerificationCode();
+  const nonce = crypto.randomUUID();
+  const hash = await verificationHash(env, email, nonce, code);
+  await repository.write('Reserve registration email verification', async snapshot => {
+    if (await repository.json(snapshot, `${root}/account.json`)) fail(409, '此邮箱已注册，请直接登录。', 'account_exists');
+    const previous = await repository.json(snapshot, path);
+    const now = Math.floor(Date.now() / 1000);
+    if (previous && previous.requested_at + VERIFICATION_COOLDOWN > now) fail(429, '验证码已发送，请稍等 60 秒后再试。', 'verification_cooldown');
+    const sentTimes = (previous?.send_times || []).filter(time => Number.isSafeInteger(time) && time > now - 3600);
+    if (sentTimes.length >= VERIFICATION_SENDS_PER_HOUR) fail(429, '此邮箱验证码发送次数过多，请一小时后再试。', 'verification_send_limit');
+    const challenge = { schema_version: 1, nonce, code_hash: hash, requested_at: now, expires_at: now + VERIFICATION_SECONDS, attempts: 0, send_times: [...sentTimes, now], delivery_state: 'pending' };
+    return { changes: [{ path, text: jsonFile(challenge) }] };
+  });
+  try {
+    await sendEmail(env, { email, code, expiresMinutes: VERIFICATION_SECONDS / 60 });
+  } catch {
+    try {
+      await repository.write('Mark registration email delivery failure', async snapshot => {
+        const challenge = await repository.json(snapshot, path);
+        return { changes: challenge?.nonce === nonce ? [{ path, text: jsonFile({ ...challenge, delivery_state: 'failed' }) }] : [] };
+      });
+    } catch { /* Pending challenges also fail closed. Never expose an upstream error. */ }
+    fail(503, '注册邮件发送失败，请稍后重试或联系站点管理员。', 'email_delivery_failed');
+  }
+  await repository.write('Confirm registration email delivery', async snapshot => {
+    const challenge = await repository.json(snapshot, path);
+    if (challenge?.nonce !== nonce) fail(409, '验证码已更新，请使用最新邮件中的验证码。', 'verification_replaced');
+    return { changes: [{ path, text: jsonFile({ ...challenge, delivery_state: 'sent' }) }] };
+  });
+  return { sent: true, expires_in: VERIFICATION_SECONDS, retry_after: VERIFICATION_COOLDOWN };
+}
 async function makeSession(env, account) {
   const now = Math.floor(Date.now() / 1000);
   const payload = { sub: account.id, email: account.email, sv: account.session_version, jti: crypto.randomUUID(), iat: now, exp: now + SESSION_SECONDS, aud: 'write-then-publish' };
@@ -299,7 +357,7 @@ async function mapLimited(items, action, concurrency = 4) {
   return results;
 }
 
-export async function handleStorageRequest(request, env, fetcher = fetch) {
+export async function handleStorageRequest(request, env, fetcher = fetch, services = {}) {
   try {
     const configuration = storageConfiguration(env);
     if (configuration.provider !== 'github') fail(503, configuration.error, 'storage_not_configured');
@@ -308,27 +366,52 @@ export async function handleStorageRequest(request, env, fetcher = fetch) {
     if (request.headers.get('Sec-Fetch-Site') === 'cross-site') fail(403, '不允许跨站访问账号存储。', 'cross_origin');
     const route = url.pathname.slice('/api/storage'.length);
     const repository = new GitHubRepository(env, fetcher);
-    if (request.method === 'POST' && (route === '/auth/signup' || route === '/auth/signin')) {
+    if (request.method === 'POST' && ['/auth/signup', '/auth/signin', '/auth/signup-code'].includes(route)) {
       if (!env.AUTH_RATE_LIMIT?.limit) fail(503, '账号请求限流尚未配置，请联系部署管理员。', 'auth_rate_limit_not_configured');
       const { success } = await env.AUTH_RATE_LIMIT.limit({ key: request.headers.get('CF-Connecting-IP') || 'local-test' });
       if (!success) fail(429, '账号请求过于频繁，请稍后重试。', 'auth_rate_limit');
-      const credentials = normalizeCredentials(await requestJson(request));
+      const body = await requestJson(request);
+      if (route === '/auth/signup-code') {
+        const email = normalizeEmail(body.email);
+        throttleAuth(request, email);
+        return responseJson(await requestSignupCode(repository, env, email, services.sendVerificationEmail || sendVerificationEmail));
+      }
+      const credentials = normalizeCredentials(body);
       throttleAuth(request, credentials.email);
       const id = await sha256(credentials.email);
       const root = userRoot(repository, id);
       let account;
       if (route === '/auth/signup') {
+        if (typeof body.code !== 'string' || !/^\d{6}$/.test(body.code.trim())) fail(400, '请先获取并填写邮件中的 6 位验证码。', 'verification_required');
+        const code = body.code.trim();
         const salt = crypto.getRandomValues(new Uint8Array(16));
         const now = new Date().toISOString();
-        account = { schema_version: 1, id, email: credentials.email, password: { algorithm: 'PBKDF2-SHA256', iterations: PASSWORD_ITERATIONS, salt: bytesToBase64(salt), hash: bytesToBase64(await passwordHash(credentials.password, salt)) }, session_version: 1, revoked_sessions: [], created_at: now };
-        await repository.write('Create writing account', async snapshot => {
+        account = { schema_version: 1, id, email: credentials.email, password: { algorithm: 'PBKDF2-SHA256', iterations: PASSWORD_ITERATIONS, salt: bytesToBase64(salt), hash: bytesToBase64(await passwordHash(credentials.password, salt)) }, session_version: 1, revoked_sessions: [], created_at: now, email_verified_at: now };
+        const verificationResult = await repository.write('Verify email and create writing account', async snapshot => {
           if (await repository.json(snapshot, `${root}/account.json`)) fail(409, '此邮箱已注册，请直接登录。', 'account_exists');
+          const path = registrationPath(repository, id);
+          const challenge = await repository.json(snapshot, path);
+          if (!challenge || challenge.delivery_state !== 'sent') return { changes: [], result: { status: 400, error: '请先获取邮箱验证码，发送成功后再注册。', code: 'verification_required' } };
+          if (challenge.expires_at <= Math.floor(Date.now() / 1000)) return { changes: [], result: { status: 400, error: '验证码已过期，请重新获取。', code: 'verification_expired' } };
+          if (challenge.attempts >= VERIFICATION_ATTEMPTS) return { changes: [], result: { status: 429, error: '验证码错误次数过多，请重新获取验证码。', code: 'verification_attempts_exceeded' } };
+          const actual = await verificationHash(env, credentials.email, challenge.nonce, code);
+          if (!constantEqual(encoder.encode(actual), encoder.encode(challenge.code_hash))) {
+            const attempts = challenge.attempts + 1;
+            const locked = attempts >= VERIFICATION_ATTEMPTS;
+            return { changes: [{ path, text: jsonFile({ ...challenge, attempts }) }], result: {
+              status: locked ? 429 : 400,
+              error: locked ? '验证码错误次数过多，请重新获取验证码。' : '验证码不正确，请检查最新邮件。',
+              code: locked ? 'verification_attempts_exceeded' : 'verification_invalid',
+            } };
+          }
           return { changes: [
             { path: `${root}/account.json`, text: jsonFile(account) },
             { path: `${root}/profile.json`, text: jsonFile({ user_id: id, display_name: '', avatar_url: '', updated_at: now }) },
             { path: `${root}/projects/index.json`, text: jsonFile({ schema_version: 1, projects: [] }) },
+            { path, delete: true },
           ] };
         });
+        if (verificationResult) fail(verificationResult.status, verificationResult.error, verificationResult.code);
       } else {
         const snapshot = await repository.snapshot();
         account = await repository.json(snapshot, `${root}/account.json`);
@@ -445,6 +528,7 @@ export async function handleStorageRequest(request, env, fetcher = fetch) {
     }
     fail(404, '存储接口不存在。', 'not_found');
   } catch (error) {
+    if (error instanceof EmailError) return responseJson({ error: error.message, code: error.code }, 503);
     if (error instanceof StorageError) return responseJson({ error: error.message, code: error.code }, error.status);
     // Do not return upstream payloads, repository names, secrets or stack traces.
     return responseJson({ error: '存储处理失败，请稍后重试。', code: 'internal_error' }, 500);

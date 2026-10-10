@@ -12,19 +12,24 @@ const tokenFor = user => user.session.access_token;
 function harness(options = {}) {
   const fake = createFakeGitHub(options);
   const env = fakeGitHubEnvironment(fake, options.env);
+  const deliveries = [];
   async function request(route, { method = 'GET', token, json, body, headers = {} } = {}) {
     const result = await handleStorageRequest(new Request(`https://writing.example/api/storage${route}`, {
       method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(json === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers },
       ...(json === undefined && body === undefined ? {} : { body: json === undefined ? body : JSON.stringify(json) }),
-    }), env, fake.fetch);
+    }), env, fake.fetch, { sendVerificationEmail: async (_env, message) => { deliveries.push(message); } });
     return { status: result.status, headers: result.headers, data: result.headers.get('Content-Type')?.includes('application/json') ? await result.json() : new Uint8Array(await result.arrayBuffer()) };
   }
   async function register(email = 'writer@example.com') {
-    const result = await request('/auth/signup', { method: 'POST', json: { email, password } });
+    const send = await request('/auth/signup-code', { method: 'POST', json: { email } });
+    assert.equal(send.status, 200, JSON.stringify(send.data));
+    const code = deliveries.findLast(message => message.email === email.trim().toLowerCase()).code;
+    const result = await request('/auth/signup', { method: 'POST', json: { email, password, code } });
     assert.equal(result.status, 200, JSON.stringify(result.data));
+    result.data.testCode = code;
     return result.data;
   }
-  return { fake, env, request, register };
+  return { fake, env, request, register, deliveries };
 }
 
 async function upload(context, user, projectId, extension, bytes) {
@@ -58,7 +63,7 @@ test('registers isolated private-repository accounts, hashes passwords, and chec
   for (const content of fake.snapshotFiles().values()) assert.ok(!Buffer.from(content).includes(Buffer.from(password)), 'plaintext password is never committed');
   assert.deepEqual(fake.json(`${root}/projects/index.json`).projects, []);
   assert.ok(fake.json(`write-then-publish/users/${bob.user.id}/profile.json`));
-  assert.equal((await request('/auth/signup', { method: 'POST', json: { email: 'alice@example.com', password } })).status, 409);
+  assert.equal((await request('/auth/signup', { method: 'POST', json: { email: 'alice@example.com', password, code: alice.testCode } })).status, 409);
   assert.equal((await request('/auth/signin', { method: 'POST', json: { email: 'alice@example.com', password: 'wrong-password' } })).status, 401);
   const login = await request('/auth/signin', { method: 'POST', json: { email: 'ALICE@example.com', password } });
   assert.equal(login.status, 200);
@@ -167,7 +172,7 @@ test('concurrent users and concurrent projects preserve every write through fast
 
 test('rejects public repositories, upstream authorization/rate/network errors, and cross-site mutations without leaking credentials', async () => {
   const publicContext = harness({ private: false });
-  const publicResult = await publicContext.request('/auth/signup', { method: 'POST', json: { email: 'public@example.com', password } });
+  const publicResult = await publicContext.request('/auth/signup-code', { method: 'POST', json: { email: 'public@example.com' } });
   assert.equal(publicResult.status, 503);
   assert.equal(publicResult.data.code, 'public_repository');
   assert.equal(publicContext.fake.snapshotFiles().size, 1);

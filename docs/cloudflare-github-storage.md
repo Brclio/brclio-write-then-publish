@@ -23,8 +23,15 @@
 | `GITHUB_DATA_PREFIX` | Variable | 仓库内根目录，默认 `write-then-publish` |
 | `GITHUB_TOKEN` | **Secret** | 该数据仓库的 Contents 读写 token |
 | `SESSION_SECRET` | **Secret** | 独立随机字符串，至少 32 个字符，用于签署登录会话 |
+| `SMTP_HOST` | Variable | `smtp.gmail.com`，默认值 |
+| `SMTP_PORT` | Variable | `465`，使用隐式 TLS；不接受明文 SMTP |
+| `SMTP_USERNAME` | Variable | 完整的 Gmail 或 Google Workspace 发件邮箱 |
+| `SMTP_PASSWORD` | **Secret** | 专用于本项目的 Google 应用专用密码 |
+| `SMTP_FROM` | Variable | 发件地址，默认使用 `SMTP_USERNAME`；Gmail 请使用该邮箱或已验证的发件别名 |
 
-`SESSION_SECRET` 可用 `openssl rand -hex 32` 生成，轮换后所有旧会话失效，需要重新登录。不要把 Secret 配置成公开前端变量。CLI 可用 `npx wrangler secret put GITHUB_TOKEN` 和 `npx wrangler secret put SESSION_SECRET` 安全输入；普通运行时变量也可在 Cloudflare 控制台设置。首次部署配置变量后，需要使配置生效再验证注册。
+`SESSION_SECRET` 可用 `openssl rand -hex 32` 生成，轮换后所有旧会话和待使用的验证码失效，需要重新登录或重新获取验证码。不要把 Secret 配置成公开前端变量。CLI 可用 `npx wrangler secret put GITHUB_TOKEN`、`npx wrangler secret put SESSION_SECRET` 和 `npx wrangler secret put SMTP_PASSWORD` 安全输入；普通运行时变量也可在 Cloudflare 控制台设置。首次部署配置变量后，需要使配置生效再验证注册。
+
+Gmail 发件账号需先开启两步验证，再创建一个专用于本项目的[应用专用密码](https://support.google.com/mail/answer/185833)。这里填写应用专用密码，不能填写 Google 账号的普通登录密码。Worker 通过 `cloudflare:sockets` 连接 `smtp.gmail.com:465` 并从连接开始启用 TLS；不需要另外部署邮件代理服务，也不使用被 Cloudflare 禁止的 SMTP 25 端口。Gmail 仍有发送配额和反滥用检查；SMTP 失败时界面会提示发送失败，不会显示已成功发送。不要把应用专用密码、验证码或收件内容写入代码、日志或截图。
 
 本地测试：复制 `.dev.vars.example` 为 `.dev.vars`，填入测试私有仓库及凭证，运行 `npm ci` 和 `npm run dev:cloudflare`。`.dev.vars` 已加入忽略列表。不要使用生产用户数据进行测试。
 
@@ -32,6 +39,8 @@
 
 ```text
 write-then-publish/
+├── registration/
+│   └── <规范化邮箱摘要>.json
 └── users/
     ├── <用户标识 A>/
     │   ├── account.json
@@ -51,11 +60,15 @@ write-then-publish/
 
 每位用户注册时创建专属目录。用户标识由服务端根据规范化邮箱计算，不接受客户端指定用户目录。`account.json` 保存邮箱、密码哈希及会话版本；`profile.json` 保存昵称与头像；`index.json` 只保存稿件摘要和版本；正文为 UTF-8 Markdown，排版参数与素材引用为可读 JSON；图片、GIF 和实况原视频为各自独立文件，保留原始字节。实际素材文件名由内容摘要确定。
 
+`registration/` 保存注册验证码的 HMAC 校验值和有效期、重试次数等控制信息，验证码本身不写入仓库。HMAC 使用服务端 Secret，获取私有仓库内容不能直接还原验证码。校验通过后，在同一次 Git 提交中删除验证记录并创建账号目录，避免并发重复使用。
+
 **业务数据不加密，拥有仓库权限的人可以直接阅读正文、资料与素材。密码仅保存随机盐和 PBKDF2 哈希，不保存明文密码。** GitHub 仓库的提交历史也会保留旧版本；应用内删除草稿会删除当前分支对应文件，不会擦除 Git 历史。
 
 ## 4. 使用与验收
 
-打开部署域名，通过现有「登录 / 注册」入口注册邮箱账号，立即进入工作区。GitHub 模式使用独立账号体系，原 Supabase 账号需重新注册；旧稿可通过现有 ZIP 原稿导出、导入功能搬入。此模式不提供 Google 登录、邮件确认和邮件找回密码，相应入口自动隐藏。
+打开部署域名，通过现有「登录 / 注册」入口填写邮箱，获取并输入 6 位注册验证码，再设置密码完成注册并进入工作区。验证码有效期为 10 分钟，每个邮箱发送后需等待 60 秒才能重发，每小时最多发送 6 次，错误输入 5 次后需重新获取；验证码只用于对应邮箱且只能使用一次。GitHub 模式使用独立账号体系，原 Supabase 账号需重新注册；旧稿可通过现有 ZIP 原稿导出、导入功能搬入。此模式不提供 Google 登录和邮件找回密码，相应入口自动隐藏。
+
+上线时先使用可查看收件箱的邮箱获取验证码，确认 Gmail 实际投递成功，再用邮件中的验证码完成注册。校验错误、过期和重复使用的验证码均应被拒绝，且注册完成前不应创建用户目录。部署的公开配置接口只返回存储模式等必要信息，不包含 GitHub token、会话密钥、SMTP 密码或验证码。
 
 草稿在本机缓存后自动同步，账号面板显示同步状态。确认同步完成后，使用另一浏览器登录，核对正文、排版、普通图片、原始 GIF、Live Photo 原视频和头像昵称；同时检查数据仓库内是否出现上述多文件目录。再注册第二个账号，确认两位用户只能读取自己的草稿，分别修改、删除也不会影响对方。
 
@@ -65,10 +78,10 @@ write-then-publish/
 
 单个素材最多 10 MiB；超限或上传失败会明确提示尚未同步，本机草稿仍可编辑和导出。GitHub 模式适合个人或小规模使用；每次同步涉及 GitHub API 和 Git 提交，受 token 限额、二级限流、仓库容量以及 Cloudflare 运行时限额约束。**建议使用 Workers Paid**：读取较多稿件和素材时会超过 Free 每请求 50 次子请求或 CPU 限额，例如 24 篇稿件的多文件读取已需要超过 50 次 GitHub 请求。网络失败和限流不会被显示成同步成功。
 
-Wrangler 配置包含 `AUTH_RATE_LIMIT` 绑定，同一来源每分钟最多 10 次注册 / 登录请求。部署时必须保留此绑定，缺失时服务端会停止认证操作；它不会把账号、文章或素材写入 Cloudflare 数据库。
+Wrangler 配置包含 `AUTH_RATE_LIMIT` 绑定，同一来源每分钟最多 10 次验证码 / 注册 / 登录请求，发送验证码另受邮箱级冷却和发送上限约束。部署时必须保留此绑定，缺失时服务端会停止认证操作；它不会把账号、文章或素材写入 Cloudflare 数据库。
 
 数据目录、仓库和分支应在启用后保持稳定。修改这些变量会切换到另一套存储位置，不会自动搬迁旧数据。不要直接编辑 `account.json` 的哈希和会话字段。备份需同时保存整个数据仓库与 Cloudflare 运行时配置，Secret 应通过独立安全渠道保存。
 
 代码检查使用 `npm test`；Worker 与静态资源打包检查使用 `npx wrangler deploy --dry-run`。本地模拟测试不代表已完成真实 Cloudflare 部署或真实 GitHub 仓库验收，生产启用后仍应按上面的双账号、跨浏览器流程确认。
 
-实现参考：[Cloudflare Static Assets 配置](https://developers.cloudflare.com/workers/static-assets/binding/)、[GitHub Git Trees API](https://docs.github.com/en/rest/git/trees)、[GitHub Git References API](https://docs.github.com/en/rest/git/refs)。
+实现参考：[Cloudflare Static Assets 配置](https://developers.cloudflare.com/workers/static-assets/binding/)、[Cloudflare TCP sockets 与 SMTP 端口限制](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/)、[Gmail SMTP 配置](https://support.google.com/a/answer/176600)、[Google 应用专用密码](https://support.google.com/mail/answer/185833)、[GitHub Git Trees API](https://docs.github.com/en/rest/git/trees)、[GitHub Git References API](https://docs.github.com/en/rest/git/refs)。

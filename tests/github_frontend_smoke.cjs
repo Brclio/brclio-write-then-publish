@@ -85,9 +85,13 @@ async function testAdapter() {
   vm.createContext(ctx); vm.runInContext(adapter, ctx);
   const api = ctx.window.WriteThenPublishCloud, events = [];
   api.onAuthStateChange((event, value) => events.push({ event, value }));
-  assert.equal((await api.signUp('a@example.com', 'password123')).session.user.id, 'a');
+  assert.equal((await api.signUp('a@example.com', 'password123', '123456')).session.user.id, 'a');
+  assert.equal(JSON.parse(requests.at(-1).options.body).code, '123456', 'signup carries the email verification code');
   assert.equal(events[0].event, 'SIGNED_IN');
   assert.equal((await api.getSession()).user.id, 'a');
+  await api.requestSignupCode('a@example.com');
+  assert.deepEqual(JSON.parse(requests.at(-1).options.body), { email: 'a@example.com' });
+  assert.equal(requests.at(-1).options.headers.has('Authorization'), false, 'email verification requests do not borrow a signed-in account session');
   await api.upsertProfile({ displayName: 'Author' });
   assert.equal(JSON.parse(requests.at(-1).options.body).avatarUrl, '', 'nickname updates satisfy the server profile contract');
   const oldSession = { ...session, access_token: 'bound-old-token' };

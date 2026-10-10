@@ -6,3 +6,10 @@ GITHUB_BRANCH=main
 GITHUB_DATA_PREFIX=write-then-publish
 GITHUB_TOKEN=replace-with-private-repository-contents-read-write-token
 SESSION_SECRET=replace-with-a-random-secret-at-least-32-characters
+# 注册验证码：先开启 Google 两步验证，再创建专用于本项目的应用专用密码。
+# SMTP_PASSWORD 不使用 Google 账号的登录密码；生产环境必须保存为 Cloudflare Secret。
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+SMTP_USERNAME=your-sender@gmail.com
+SMTP_PASSWORD=replace-with-a-google-app-password
+SMTP_FROM=your-sender@gmail.com

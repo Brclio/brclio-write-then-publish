@@ -708,6 +708,13 @@
               <span>再次输入密码</span>
               <input id="accountPasswordConfirmInput" type="password" autocomplete="new-password" minlength="8" placeholder="再次输入相同密码" />
             </label>
+            <label id="accountSignupCodeField" hidden>
+              <span>邮箱验证码</span>
+              <span class="account-input-wrap">
+                <input id="accountSignupCodeInput" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="6 位验证码，10 分钟内有效" />
+                <button id="accountSendSignupCodeBtn" class="account-password-toggle" type="button" title="发送邮箱验证码" aria-label="发送邮箱验证码">发送</button>
+              </span>
+            </label>
             <label id="accountNewPasswordField" hidden>
               <span>设置新密码</span>
               <input id="accountNewPasswordInput" type="password" autocomplete="new-password" minlength="8" placeholder="至少 8 位" />

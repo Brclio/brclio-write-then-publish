@@ -4,6 +4,7 @@
   "main": "cloudflare/worker.mjs",
   "compatibility_date": "2026-10-10",
   "keep_vars": true,
+  "routes": [{ "pattern": "write.brclio.com", "custom_domain": true }],
   "ratelimits": [{
     "name": "AUTH_RATE_LIMIT",
     "namespace_id": "1001",

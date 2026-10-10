@@ -183,6 +183,8 @@ export function fakeGitHubEnvironment(fake, overrides = {}) {
     STORAGE_PROVIDER: 'github', GITHUB_OWNER: fake.owner, GITHUB_REPO: fake.repo,
     GITHUB_BRANCH: fake.branch, GITHUB_TOKEN: fake.token, GITHUB_DATA_PREFIX: 'write-then-publish',
     SESSION_SECRET: 'test-session-secret-with-at-least-32-bytes',
+    SMTP_HOST: 'smtp.gmail.com', SMTP_PORT: '465', SMTP_USERNAME: 'test-sender@gmail.com',
+    SMTP_PASSWORD: 'test-google-app-password', SMTP_FROM: 'test-sender@gmail.com',
     AUTH_RATE_LIMIT: { async limit() { return { success: true }; } },
     ...overrides,
   };

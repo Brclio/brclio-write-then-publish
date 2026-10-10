@@ -34,13 +34,16 @@
       const error = new Error(result.error || result.message || `GitHub 存储请求失败（${response.status}）。`);
       error.code = result.code || "";
       error.status = response.status;
+      error.retryAfter = Number(response.headers.get("Retry-After")) || Number(result.retry_after) || 0;
       throw error;
     }
     return result;
   }
 
-  async function authenticate(action, email, password) {
-    const result = await request(`/auth/${action}`, { method: "POST", body: { email, password }, session: null });
+  async function authenticate(action, email, password, code) {
+    const result = await request(`/auth/${action}`, {
+      method: "POST", body: { email, password, ...(action === "signup" ? { code } : {}) }, session: null,
+    });
     rememberSession(result.session, "SIGNED_IN");
     return result;
   }
@@ -79,7 +82,8 @@
   window.WriteThenPublishCloud = {
     provider: "github", configured, supportsProjectSync: true, livePhotoConfigured: false,
     configurationError: configured ? "" : config.configurationError || config.error || "GitHub 私有仓库存储尚未配置，请联系站点管理员。",
-    signUp: (email, password) => authenticate("signup", email, password),
+    signUp: (email, password, code) => authenticate("signup", email, password, code),
+    requestSignupCode: (email) => request("/auth/signup-code", { method: "POST", body: { email }, session: null }),
     signIn: (email, password) => authenticate("signin", email, password),
     getSession, setSession, signOut, signOutLocal: signOut,
     onAuthStateChange(callback) { listeners.add(callback); return () => listeners.delete(callback); },
